@@ -28,6 +28,7 @@ META_CONTENT_TASKS = {
 }
 BUFFER_API = "https://api.buffer.com"
 CLOUDINARY_VIDEO_LIMIT = 100_000_000
+GTA_REEL_HASHTAGS = ("#GTA6", "#GrandTheftAutoVI", "#GTA6Live", "#GTA6Clips")
 
 
 class PlatformHTTPError(RuntimeError):
@@ -445,6 +446,14 @@ def upload_binary(method, url, path, token, *, meta=False):
                     data=stream, timeout=180).json()
 
 
+def reel_description(title, description):
+    existing = re.findall(r"(?<!\w)#\w+", f"{title}\n{description}")
+    used = {tag.casefold() for tag in existing}
+    remaining = max(0, 5 - len(existing))
+    tags = [tag for tag in GTA_REEL_HASHTAGS if tag.casefold() not in used][:remaining]
+    return "\n\n".join(filter(None, (description, " ".join(tags))))
+
+
 def publish(platform, account, path, title, description, visibility, made_for_kids, record):
     token = account["token"]
     identifier = account["id"]
@@ -459,6 +468,7 @@ def publish(platform, account, path, title, description, visibility, made_for_ki
         record("Submitting video", None)
         remote = upload_binary("PUT", session.headers["Location"], path, token)["id"]
         return remote, f"https://www.youtube.com/shorts/{remote}"
+    description = reel_description(title, description)
     if platform == "facebook":
         endpoint = f"{identifier}/video_reels"
         session = graph("POST", endpoint, token, data={"upload_phase": "start"})
