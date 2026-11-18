@@ -34,6 +34,8 @@ Press Enter for a manual clip. The default gameplay highlight is 45 seconds, wit
 
 For automatic chat spikes, set `TWITCH_CLIENT_ID` and `TWITCH_USER_TOKEN` in the process environment and add `--chat`. Use a Twitch user token issued to that client with `user:read:chat` scope. Tune `--chat-offset` after comparing a few clips with the stream timeline. Increase it to move cuts earlier on the capture timeline.
 
+For the Windows dashboard, register a Public app in the Twitch Developer Console and run `& .\.venv\Scripts\python.exe twitch_chat_auth.py YOUR_CLIENT_ID`. Follow the Twitch activation prompt. The dashboard uses the Windows-encrypted authorization to enable **Detect chat spikes** and renews expiring access when a chat-enabled capture starts.
+
 The chat detector needs at least one minute of baseline. A spike requires at least five unique chatters and at least three times the recent median count. The cooldown is at least 30 seconds and grows with longer clip windows to avoid overlapping chat-triggered clips. If the video feed ends, restart capture to reconnect. Press Ctrl+C to stop.
 
 ## Dashboard

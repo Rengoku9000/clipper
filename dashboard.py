@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -17,6 +18,7 @@ from clipping_agent import ClippingAgent
 from credential_store import CredentialStore
 from publishing_agent import PublishingAgent
 from stream_monitoring_agent import StreamMonitoringAgent
+from twitch_chat_auth import configured as twitch_chat_configured
 
 
 ROOT = Path(__file__).resolve().parent
@@ -108,7 +110,7 @@ class Dashboard:
                                       "active": sum(post["status"] == "working" for post in posts)}},
             "activity": recent, "chat": chat, "average_latency": latency,
             "accounts": self.publisher.accounts.summary(), "rehearsal": bool(self.options.rehearsal_input),
-            "chat_configured": bool(os.getenv("TWITCH_CLIENT_ID") and os.getenv("TWITCH_USER_TOKEN")),
+            "chat_configured": twitch_chat_configured(),
             "top_caption_enabled": True,
             "clip_presets": [
                 {"id": key, "label": label, "before": before, "after": after,

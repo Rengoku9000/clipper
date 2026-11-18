@@ -8,7 +8,7 @@ import time
 from queue import Empty, Queue
 from uuid import uuid4
 
-from publishing import (Accounts, BufferRejected, PLATFORMS, cloudinary_video,
+from publishing import (Accounts, BufferRejected, CloudinaryAuthorizationError, PLATFORMS, cloudinary_video,
                         create_buffer_post, host_buffer_video, publish, read_buffer_post)
 
 
@@ -206,7 +206,7 @@ class PublishingAgent:
             detail = str(error) if isinstance(error, (ValueError, RuntimeError)) else "The upload could not be completed."
             if submitting:
                 detail += " Check the platform for this clip before making another upload."
-            elif buffer_asset and not self.remove_buffer_asset(account, buffer_asset):
+            elif buffer_asset and not isinstance(error, CloudinaryAuthorizationError) and not self.remove_buffer_asset(account, buffer_asset):
                 detail += " Check the Cloudinary asset before retrying."
             record(detail, status="check" if submitting else "failed")
 

@@ -30,6 +30,17 @@ BUFFER_API = "https://api.buffer.com"
 CLOUDINARY_VIDEO_LIMIT = 100_000_000
 
 
+class PlatformHTTPError(RuntimeError):
+    def __init__(self, status, provider_code=None):
+        self.status = status
+        self.provider_code = provider_code
+        super().__init__(f"Platform returned HTTP {status}. Check the app permissions and account access.")
+
+
+class CloudinaryAuthorizationError(RuntimeError):
+    """Cloudinary rejected the credentials before accepting the request."""
+
+
 def call(method, url, *, token=None, oauth=False, headers=None, timeout=25, **kwargs):
     headers = dict(headers or {})
     if token:
@@ -41,12 +52,25 @@ def call(method, url, *, token=None, oauth=False, headers=None, timeout=25, **kw
         raise RuntimeError("Platform request could not be completed.") from error
     if not response.ok or response.is_redirect:
         # Keep request URLs, authorization headers and provider payloads out of logs.
-        raise RuntimeError(f"Platform returned HTTP {response.status_code}. Check the app permissions and account access.")
+        code = None
+        if urlparse(url).hostname == "graph.facebook.com":
+            try:
+                value = response.json()["error"]["code"]
+                if isinstance(value, int):
+                    code = value
+            except (ValueError, TypeError, KeyError):
+                pass
+        raise PlatformHTTPError(response.status_code, code)
     return response
 
 
 def graph(method, path, token=None, **kwargs):
-    return call(method, f"{META_API}/{path}", token=token, **kwargs).json()
+    try:
+        return call(method, f"{META_API}/{path}", token=token, **kwargs).json()
+    except PlatformHTTPError as error:
+        if error.provider_code == 190:
+            raise RuntimeError("Meta rejected the saved access. Reconnect Instagram or Facebook in Accounts.") from error
+        raise
 
 
 def buffer_graph(key, query, variables=None):
@@ -111,6 +135,16 @@ def read_buffer_post(account, remote):
     """, {"id": remote})["post"]
 
 
+def cloudinary_call(account, method, endpoint, **kwargs):
+    try:
+        return call(method, f"https://api.cloudinary.com/v1_1/{account['cloud_name']}/{endpoint}",
+                    auth=(account["cloud_key"], account["cloud_secret"]), **kwargs)
+    except PlatformHTTPError as error:
+        if error.status == 401:
+            raise CloudinaryAuthorizationError("Cloudinary rejected the credentials. Reconnect Buffer in Accounts with the Cloudinary cloud name, API key, and API secret from the same environment.") from error
+        raise RuntimeError(f"Cloudinary request failed. {error}") from error
+
+
 def cloudinary_video(account, operation, public_id, path=None):
     fields = {"public_id": public_id}
     options = {}
@@ -118,17 +152,11 @@ def cloudinary_video(account, operation, public_id, path=None):
         fields["invalidate"] = "true"
     else:
         fields["overwrite"] = "false"
-    try:
-        if path is not None:
-            with path.open("rb") as stream:
-                options["files"] = {"file": ("clip.mp4", stream, "video/mp4")}
-                return call("POST", f"https://api.cloudinary.com/v1_1/{account['cloud_name']}/video/{operation}",
-                            auth=(account["cloud_key"], account["cloud_secret"]),
-                            data=fields, timeout=120, **options).json()
-        return call("POST", f"https://api.cloudinary.com/v1_1/{account['cloud_name']}/video/{operation}",
-                    auth=(account["cloud_key"], account["cloud_secret"]), data=fields, timeout=20).json()
-    except RuntimeError as error:
-        raise RuntimeError(f"Cloudinary request failed. {error}") from error
+    if path is not None:
+        with path.open("rb") as stream:
+            options["files"] = {"file": ("clip.mp4", stream, "video/mp4")}
+            return cloudinary_call(account, "POST", f"video/{operation}", data=fields, timeout=120, **options).json()
+    return cloudinary_call(account, "POST", f"video/{operation}", data=fields, timeout=20).json()
 
 
 def host_buffer_video(account, public_id, path):
@@ -217,15 +245,17 @@ class Accounts:
             raise ValueError("Enter the Cloudinary cloud name and numeric API key.")
         if not all(re.fullmatch(r"[!-~]{12,512}", value) for value in (buffer_key, cloud_secret)):
             raise ValueError("Enter the Buffer API key and Cloudinary API secret.")
+        credentials = {"buffer_key": buffer_key, "cloud_name": cloud_name,
+                       "cloud_key": cloud_key, "cloud_secret": cloud_secret}
+        cloudinary_call(credentials, "GET", "ping", timeout=10)
         channels = buffer_channels(buffer_key)
         with self.lock:
             if any(account.get("via") != "buffer" for account in self.destinations.get("youtube", {}).values()):
                 raise ValueError("Disconnect direct YouTube OAuth before connecting Buffer.")
-            self.save(buffer_credentials={"buffer_key": buffer_key, "cloud_name": cloud_name,
-                                          "cloud_key": cloud_key, "cloud_secret": cloud_secret},
+            self.save(buffer_credentials=credentials,
                       destinations={**self.destinations, "youtube": channels})
             self.states = {key: value for key, value in self.states.items() if value[0] != "youtube"}
-            self.notice = "YouTube connected via Buffer. The media host will be verified on the first approved upload."
+            self.notice = "Buffer and Cloudinary credentials verified. YouTube is connected."
 
     def configure_meta(self, identifier, secret, config_id):
         if not all(isinstance(value, str) for value in (identifier, secret, config_id)):

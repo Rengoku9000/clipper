@@ -11,6 +11,7 @@ from collections import deque
 from pathlib import Path
 
 from clipper import CLIP_PRESETS, DEFAULT_CLIP_PRESET, normalize_top_caption, youtube_video_id, youtube_watch_url
+from twitch_chat_auth import capture_credentials
 
 
 EVENT_PREFIX = "CLIPPER_EVENT "
@@ -126,8 +127,6 @@ class ClippingAgent:
                 raise ValueError("YouTube rate-limited capture. Wait a minute before trying again.")
             if channel in self.sessions:
                 raise ValueError("That channel is already running.")
-            if chat and not all(os.getenv(key) for key in ("TWITCH_CLIENT_ID", "TWITCH_USER_TOKEN")):
-                raise ValueError("Set the Twitch OAuth values before starting chat detection.")
             command = [sys.executable, "-u", str(self.root / "clipper.py"), "live", source,
                        "--quality", "720p60,720p,480p30,480p,best", "--output-dir", str(destination),
                        "--dashboard-events"]
@@ -145,6 +144,9 @@ class ClippingAgent:
             command.extend(["--before", str(before), "--after", str(after)])
             environment = {key: value for key, value in os.environ.items()
                            if not key.startswith(("CLIPPER_META_", "CLIPPER_GOOGLE_"))}
+            if chat:
+                client_id, token = capture_credentials()
+                environment.update(TWITCH_CLIENT_ID=client_id, TWITCH_USER_TOKEN=token)
             process = subprocess.Popen(
                 command, cwd=self.root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
