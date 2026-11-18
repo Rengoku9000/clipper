@@ -147,6 +147,7 @@ function postLabel(status) {
   return ({
     published: ["Accepted", "good"], uploaded: ["Uploaded", "good"], working: ["Working", "purple"],
     queued: ["Queued", "purple"],
+    waiting: ["Waiting for account", "warn"],
     buffer_pending: ["In Buffer", "purple"],
     check: ["Check platform", "warn"], failed: ["Failed", "bad"],
   })[status] || [status, ""];
@@ -275,14 +276,14 @@ function publishing() {
   }).join("");
   const count = status => state.posts.filter(post => post.status === status).length;
   const bufferReview = state.posts.some(post => post.buffer_asset && post.remote && ["buffer_pending", "check"].includes(post.status));
-  return heading("Publishing", "Track the Publishing Agent’s queue and results by destination.") + statRow([
+  return heading("Publishing", "New live clips publish automatically to YouTube, Instagram and Facebook. YouTube Shorts are public.") + statRow([
     ["Accepted posts", count("published"), "Public requests accepted", "send"],
     ["Private / unlisted", count("uploaded"), "YouTube uploads", "film"],
     ["In progress", count("queued") + count("working") + count("buffer_pending"), "Queued, uploading or processing", "timer"],
-    ["Needs attention", count("check") + count("failed"), "Failed or awaiting verification", "activity"],
+    ["Needs attention", count("check") + count("failed") + count("waiting"), "Account needed, failed or awaiting verification", "activity"],
   ]) + panel("Upload history", "", rows ? `<div class="table-wrap"><table><thead><tr><th>Clip</th><th>Platform</th>
     <th>Account</th><th>Status</th><th>Details</th><th>Updated</th><th>Post</th></tr></thead><tbody>${rows}</tbody></table></div>`
-    : '<div class="empty">No uploads yet. Open a clip preview to choose a publishing destination.</div>',
+    : '<div class="empty">New live clips will appear here as soon as they’re ready.</div>',
     bufferReview ? '<button class="secondary" data-refresh-buffer>Check Buffer status</button>' :
       '<a class="text-link" href="#library">Open clip library</a>');
 }
@@ -450,7 +451,7 @@ function setVisibility(destination) {
 function setup(provider) {
   if (provider === "buffer") {
     showDialog("Set up Buffer for YouTube", `<form id="buffer-setup-form" autocomplete="off">
-      <p>Connect your YouTube channel in Buffer and use the Free plans for Buffer and Cloudinary. Paste the credentials here to load them for this session.</p>
+      <p>Connect your YouTube channel in Buffer and use the Free plans for Buffer and Cloudinary.${state.accounts.persistent ? " Windows encrypts the saved credentials for your user account." : " Paste the credentials here to load them for this session."}</p>
       <label>Buffer API key<input type="password" name="buffer_key" autocomplete="new-password" required></label>
       <label>Cloudinary cloud name<input name="cloud_name" required></label>
       <label>Cloudinary API key<input name="cloud_key" inputmode="numeric" required></label>
@@ -463,7 +464,7 @@ function setup(provider) {
   if (provider === "meta") {
     const app = state.accounts.meta_app || {};
     showDialog("Set up Meta", `<form id="meta-setup-form" autocomplete="off">
-      <p>Use the App Secret from Meta for Developers → App settings → Basic. The secret is kept in memory for this dashboard session.</p>
+      <p>Use the App Secret from Meta for Developers → App settings → Basic.${state.accounts.persistent ? " Windows encrypts the saved credentials for your user account." : " The secret is kept in memory for this dashboard session."}</p>
       <label>Meta App ID<input name="identifier" inputmode="numeric" required value="${escape(app.identifier)}"></label>
       <label>Configuration ID<input name="config_id" inputmode="numeric" required value="${escape(app.config_id)}"></label>
       <label>App Secret<input name="secret" type="password" autocomplete="new-password" required></label>
@@ -475,7 +476,7 @@ function setup(provider) {
   }
   if (state.accounts.youtube_app) {
     showDialog("Set up YouTube", `<form id="youtube-setup-form" autocomplete="off">
-      <p>Enable YouTube Data API v3 and create a Desktop OAuth client in Google Cloud. The secret is kept in memory for this dashboard session.</p>
+      <p>Enable YouTube Data API v3 and create a Desktop OAuth client in Google Cloud.${state.accounts.persistent ? " Windows encrypts the saved credentials for your user account." : " The secret is kept in memory for this dashboard session."}</p>
       <label>OAuth Client ID<input name="identifier" required value="${escape(state.accounts.youtube_app.identifier)}"></label>
       <label>OAuth Client Secret<input name="secret" type="password" autocomplete="new-password" required></label>
       <p>OAuth callback <span class="mono">${escape(state.accounts.redirects.youtube)}</span></p>
@@ -585,11 +586,11 @@ dialog.addEventListener("submit", async event => {
     } else if (form.id === "meta-setup-form") {
       await action("configure-meta", data);
       form.reset();
-      notify("Meta setup saved for this session. Connect Instagram to continue.");
+      notify("Meta setup complete. Connect Instagram to continue.");
     } else if (form.id === "youtube-setup-form") {
       await action("configure-youtube", data);
       form.reset();
-      notify("YouTube setup saved for this session. Connect YouTube to continue.");
+      notify("YouTube setup complete. Connect YouTube to continue.");
     } else if (form.id === "buffer-setup-form") {
       await action("configure-buffer", data);
       form.reset();

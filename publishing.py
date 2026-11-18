@@ -143,7 +143,9 @@ def host_buffer_video(account, public_id, path):
 
 
 class Accounts:
-    def __init__(self, local_url):
+    saved_fields = ("destinations", "meta_credentials", "youtube_credentials", "buffer_credentials")
+
+    def __init__(self, local_url, store=None):
         self.local_url = local_url
         self.lock = threading.RLock()
         self.states = {}
@@ -152,6 +154,25 @@ class Accounts:
         self.meta_credentials = None
         self.youtube_credentials = None
         self.buffer_credentials = None
+        self.store = store
+        if store:
+            try:
+                saved = store.load()
+                for field in self.saved_fields:
+                    if field in saved:
+                        setattr(self, field, saved[field])
+            except (OSError, ValueError):
+                self.notice = "Windows could not restore saved publishing connections. Reconnect your accounts."
+
+    def save(self, **changes):
+        if self.store:
+            saved = {field: getattr(self, field) for field in self.saved_fields}
+            try:
+                self.store.save({**saved, **changes})
+            except OSError as error:
+                raise ValueError("Windows could not save the publishing connections. Try again.") from error
+        for field, value in changes.items():
+            setattr(self, field, value)
 
     def settings(self, provider):
         prefix = "CLIPPER_GOOGLE" if provider == "youtube" else "CLIPPER_META"
@@ -182,9 +203,9 @@ class Accounts:
         with self.lock:
             if self.destinations.get("youtube"):
                 raise ValueError("Disconnect YouTube before changing the Google OAuth client.")
-            self.youtube_credentials = (identifier, secret)
+            self.save(youtube_credentials=(identifier, secret))
             self.states = {key: value for key, value in self.states.items() if value[0] != "youtube"}
-            self.notice = "Google OAuth settings loaded for this session. Connect YouTube to continue."
+            self.notice = "Google OAuth settings configured. Connect YouTube to continue."
 
     def configure_buffer(self, buffer_key, cloud_name, cloud_key, cloud_secret):
         if not all(isinstance(value, str) for value in (buffer_key, cloud_name, cloud_key, cloud_secret)):
@@ -200,10 +221,10 @@ class Accounts:
         with self.lock:
             if any(account.get("via") != "buffer" for account in self.destinations.get("youtube", {}).values()):
                 raise ValueError("Disconnect direct YouTube OAuth before connecting Buffer.")
+            self.save(buffer_credentials={"buffer_key": buffer_key, "cloud_name": cloud_name,
+                                          "cloud_key": cloud_key, "cloud_secret": cloud_secret},
+                      destinations={**self.destinations, "youtube": channels})
             self.states = {key: value for key, value in self.states.items() if value[0] != "youtube"}
-            self.buffer_credentials = {"buffer_key": buffer_key, "cloud_name": cloud_name,
-                                       "cloud_key": cloud_key, "cloud_secret": cloud_secret}
-            self.destinations["youtube"] = channels
             self.notice = "YouTube connected via Buffer. The media host will be verified on the first approved upload."
 
     def configure_meta(self, identifier, secret, config_id):
@@ -217,9 +238,9 @@ class Accounts:
         with self.lock:
             if self.destinations.get("instagram") or self.destinations.get("facebook"):
                 raise ValueError("Disconnect Facebook and Instagram before changing the Meta app.")
-            self.meta_credentials = (identifier, secret, config_id)
+            self.save(meta_credentials=(identifier, secret, config_id))
             self.states = {key: value for key, value in self.states.items() if value[0] != "meta"}
-            self.notice = "Meta credentials loaded for this session. Connect Instagram to authorize publishing."
+            self.notice = "Meta credentials configured. Connect Instagram to authorize publishing."
 
     def summary(self):
         with self.lock:
@@ -233,6 +254,7 @@ class Accounts:
                              "config_id": self.meta_config_id() or ""},
                 "youtube_app": {"identifier": self.settings("youtube")[0] or ""},
                 "buffer_available": True,
+                "persistent": self.store is not None,
                 "redirects": {provider: self.settings(provider)[2] for provider in ("youtube", "meta")},
                 "destinations": {
                     platform: [{key: account[key] for key in ("id", "name", "via") if key in account}
@@ -297,7 +319,11 @@ class Accounts:
             page_id = os.getenv("CLIPPER_META_PAGE_ID", "").strip()
             destinations = self.meta_destinations(token, page_id)
         with self.lock:
-            self.destinations.update(destinations)
+            if provider == "youtube" and self.buffer_credentials:
+                raise ValueError("YouTube is already connected via Buffer.")
+            credentials = ({"youtube_credentials": (identifier, secret)} if provider == "youtube" else
+                           {"meta_credentials": (identifier, secret, self.meta_config_id())})
+            self.save(destinations={**self.destinations, **destinations}, **credentials)
             count = sum(map(len, destinations.values()))
             self.notice = f"Connected {count} publishing destination{'s' if count != 1 else ''}."
             if not count:
@@ -348,9 +374,8 @@ class Accounts:
         if platform not in PLATFORMS:
             raise ValueError("Unknown platform.")
         with self.lock:
-            self.destinations.pop(platform, None)
-            if platform == "youtube":
-                self.buffer_credentials = None
+            destinations = {key: value for key, value in self.destinations.items() if key != platform}
+            self.save(destinations=destinations, buffer_credentials=None if platform == "youtube" else self.buffer_credentials)
             self.notice = "Destination disconnected from this dashboard."
 
     def get(self, platform, identifier):
@@ -368,7 +393,11 @@ class Accounts:
                     "client_id": client_id, "client_secret": secret, "grant_type": "refresh_token",
                     "refresh_token": account["refresh"],
                 }).json()
-                account.update(token=token["access_token"], expires=time.time() + token["expires_in"])
+                account = {**account, "token": token["access_token"], "expires": time.time() + token["expires_in"],
+                           "refresh": token.get("refresh_token") or account["refresh"]}
+                self.save(destinations={**self.destinations, "youtube": {
+                    **self.destinations["youtube"], identifier: account,
+                }})
             return account.copy()
 
 

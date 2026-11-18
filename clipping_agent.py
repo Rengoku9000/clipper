@@ -15,6 +15,7 @@ from clipper import CLIP_PRESETS, DEFAULT_CLIP_PRESET, normalize_top_caption, yo
 
 EVENT_PREFIX = "CLIPPER_EVENT "
 CHANNEL = re.compile(r"[a-z0-9_]{1,25}", re.IGNORECASE)
+YOUTUBE_RETRY_DELAY = 60
 
 
 class ClippingAgent:
@@ -28,6 +29,7 @@ class ClippingAgent:
         self.sessions = {}
         self.metadata = {}
         self.closed = False
+        self.retry_after = 0
 
     def event(self, channel, kind, data=None):
         data = {**(data or {}), "platform": self.platform}
@@ -83,18 +85,21 @@ class ClippingAgent:
                 item = self.clip_stats(path).copy()
                 subs = path.with_suffix(".srt")
                 item["cues"] = subs.read_text(encoding="utf-8").count(" --> ") if subs.exists() else 0
-                try:
-                    copy = json.loads(path.with_suffix(".captions.json").read_text(encoding="utf-8"))
-                    if isinstance(copy, dict):
-                        for key in ("title", "description"):
-                            if isinstance(copy.get(key), str):
-                                item[f"suggested_{key}"] = copy[key]
-                except (OSError, ValueError):
-                    pass
+                item.update({f"suggested_{key}": value for key, value in self.caption_copy(path).items()})
                 clips.append(item)
             except (OSError, ValueError, IndexError, KeyError, subprocess.TimeoutExpired):
                 continue
         return sorted(clips, key=lambda clip: clip["time"], reverse=True)
+
+    @staticmethod
+    def caption_copy(path):
+        try:
+            copy = json.loads(path.with_suffix(".captions.json").read_text(encoding="utf-8"))
+            if isinstance(copy, dict):
+                return {key: copy[key] for key in ("title", "description") if isinstance(copy.get(key), str)}
+        except (OSError, ValueError):
+            pass
+        return {}
 
     def start(self, channel, chat, rehearsal=False, top_caption="", clip_preset=DEFAULT_CLIP_PRESET):
         if self.platform == "youtube":
@@ -117,6 +122,8 @@ class ClippingAgent:
         with self.lock:
             if self.closed:
                 raise ValueError("The clipping agent is stopping.")
+            if self.platform == "youtube" and time.monotonic() < self.retry_after:
+                raise ValueError("YouTube rate-limited capture. Wait a minute before trying again.")
             if channel in self.sessions:
                 raise ValueError("That channel is already running.")
             if chat and not all(os.getenv(key) for key in ("TWITCH_CLIENT_ID", "TWITCH_USER_TOKEN")):
@@ -163,7 +170,10 @@ class ClippingAgent:
                 with self.lock:
                     if not line.startswith(EVENT_PREFIX):
                         if line:
-                            session["logs"].append(line)
+                            session["logs"].append(re.sub(r"https?://[^\s)]+", "[URL]", line))
+                            if self.platform == "youtube" and re.search(r"\b429 (?:Client Error|Too Many Requests)\b", line, re.IGNORECASE):
+                                session["rate_limited"] = True
+                                self.retry_after = time.monotonic() + YOUTUBE_RETRY_DELAY
                         continue
                     item = json.loads(line[len(EVENT_PREFIX):])
                     kind = item.pop("event")
@@ -186,6 +196,7 @@ class ClippingAgent:
                         session[stage] = max(0, session[stage] - 1)
                     if kind == "ready":
                         item["clip"] = Path(item.pop("path")).relative_to(self.clips).as_posix()
+                        item["auto_publish"] = not session["rehearsal"]
                     self.event(channel, kind, item)
         code = process.wait()
         process.stdin.close()
@@ -193,6 +204,8 @@ class ClippingAgent:
             stopping = session["status"] == "Stopping"
             self.sessions.pop(channel, None)
             detail = next(reversed(session["logs"]), "")
+            if session.get("rate_limited") and not stopping and code != 0:
+                detail = "YouTube rate-limited the capture (HTTP 429). Wait a minute before trying the live link again."
             self.event(channel, "stopped" if stopping or code == 0 else "capture_failed",
                        {"code": code, "message": detail})
 
@@ -213,7 +226,7 @@ class ClippingAgent:
         with self.lock:
             return [
                 {**{key: value for key, value in session.items()
-                    if key not in ("process", "watcher", "logs", "last_footage", "start_event")},
+                    if key not in ("process", "watcher", "logs", "last_footage", "start_event", "rate_limited")},
                  "logs": list(session["logs"])}
                 for session in self.sessions.values()
             ]

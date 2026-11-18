@@ -1,5 +1,8 @@
-"""Take reviewed clips and publish them to approved destinations."""
+"""Publish new live clips and handle manual submissions."""
 
+import logging
+import sqlite3
+import subprocess
 import threading
 import time
 from queue import Empty, Queue
@@ -10,8 +13,8 @@ from publishing import (Accounts, BufferRejected, PLATFORMS, cloudinary_video,
 
 
 class PublishingAgent:
-    def __init__(self, url, db, clips):
-        self.accounts = Accounts(url)
+    def __init__(self, url, db, clips, credential_store=None):
+        self.accounts = Accounts(url, credential_store)
         self.db = db
         self.clips = clips
         self.lock = threading.Lock()
@@ -37,8 +40,7 @@ class PublishingAgent:
         if platform == "youtube" and not isinstance(made_for_kids, bool):
             raise ValueError("Select the YouTube audience for this clip.")
         stats = self.clips.clip_stats(path)
-        if (stats["width"], stats["height"]) != (1080, 1920) or not 4 <= stats["duration"] <= 60:
-            raise ValueError("Select a 4–60 second 1080 × 1920 clip for cross-platform compatibility.")
+        self.validate_clip(stats)
         account = self.accounts.get(platform, account_id)
         identifier = (stats["id"], platform, account_id)
         stat = path.stat()
@@ -60,17 +62,96 @@ class PublishingAgent:
                            (*identifier, account["name"], "Waiting for the publishing agent", time.time(), visibility))
             self.jobs.put((self.publish_job, (identifier, path, fingerprint, title, description, visibility, made_for_kids)))
 
+    @staticmethod
+    def validate_clip(stats):
+        if (stats["width"], stats["height"]) != (1080, 1920) or not 4 <= stats["duration"] <= 60:
+            raise ValueError("Select a 4–60 second 1080 × 1920 clip for cross-platform compatibility.")
+
+    def next_automatic_post(self):
+        destinations = self.accounts.summary()["destinations"]
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            clips = db.execute("""
+                SELECT id, time, json_extract(data, '$.clip') AS clip FROM events
+                WHERE id > (SELECT event_id FROM publishing_cursor WHERE id=1)
+                  AND kind='ready' AND json_extract(data, '$.auto_publish')=1
+                ORDER BY id LIMIT 100
+            """).fetchall()
+            for clip in clips:
+                db.executemany("""INSERT OR IGNORE INTO posts
+                    (clip, platform, account, name, status, detail, updated, visibility, automatic)
+                    VALUES (?, ?, '', '', 'waiting', 'Connect one account for this platform.', ?, 'public', 1)
+                """, [(clip["clip"], platform, clip["time"]) for platform in PLATFORMS])
+            if clips:
+                db.execute("UPDATE publishing_cursor SET event_id=? WHERE id=1", (clips[-1]["id"],))
+
+            queued = db.execute("""SELECT clip, platform, account FROM posts
+                WHERE automatic=1 AND status='queued' ORDER BY updated LIMIT 1""").fetchone()
+            if queued:
+                return tuple(queued)
+
+            # A manual submission for this platform already covers the automatic request.
+            db.execute("""DELETE FROM posts AS waiting WHERE waiting.status='waiting' AND waiting.automatic=1
+                AND EXISTS (SELECT 1 FROM posts AS submitted WHERE submitted.clip=waiting.clip
+                    AND submitted.platform=waiting.platform AND submitted.account<>'' AND submitted.status<>'failed')""")
+            eligible = {platform: accounts[0] for platform, accounts in destinations.items() if len(accounts) == 1}
+            if not eligible:
+                return None
+            slots = ",".join("?" for _ in eligible)
+            waiting = db.execute(f"""SELECT clip, platform FROM posts
+                WHERE automatic=1 AND status='waiting' AND platform IN ({slots})
+                ORDER BY updated LIMIT 1""", tuple(eligible)).fetchone()
+            if not waiting:
+                return None
+            clip, platform = waiting
+            account = eligible[platform]
+            identifier = clip, platform, account["id"]
+            db.execute("""DELETE FROM posts WHERE clip=? AND platform=? AND account=? AND status='failed'""", identifier)
+            db.execute("""UPDATE posts SET account=?, name=?, status='queued', detail='Waiting for the publishing agent'
+                WHERE clip=? AND platform=? AND account=''""", (account["id"], account["name"], clip, platform))
+            return identifier
+
+    def publish_automatic(self, identifier):
+        try:
+            path = self.clips.clip_path(identifier[0])
+            stats = self.clips.clip_stats(path)
+            self.validate_clip(stats)
+            copy = self.clips.caption_copy(path)
+            title = (copy.get("title", "").strip() or f"{stats['channel']} live highlight")[:100]
+            description = copy.get("description", "").strip()[:2000]
+            stat = path.stat()
+        except (ValueError, OSError, subprocess.SubprocessError, KeyError, IndexError):
+            with self.db() as db:
+                db.execute("""UPDATE posts SET status='failed', updated=?, detail=?
+                    WHERE clip=? AND platform=? AND account=?""",
+                           (time.time(), "The clip is missing or incompatible with automatic publishing.", *identifier))
+            return
+        self.publish_job(identifier, path, (stat.st_mtime_ns, stat.st_size), title, description, "public", False)
+
     def run(self):
+        next_poll = time.monotonic() + 30
+        active = False
         while True:
             try:
-                job = self.jobs.get(timeout=30)
+                job = self.jobs.get(timeout=0 if active else 1)
             except Empty:
-                self.poll_buffer()
-                continue
-            if job is None:
-                return
-            operation, arguments = job
-            operation(*arguments)
+                pass
+            else:
+                if job is None:
+                    return
+                operation, arguments = job
+                operation(*arguments)
+            active = False
+            try:
+                if time.monotonic() >= next_poll:
+                    next_poll = time.monotonic() + 30
+                    self.poll_buffer()
+                identifier = self.next_automatic_post()
+                if identifier:
+                    self.publish_automatic(identifier)
+                    active = True
+            except sqlite3.Error:
+                logging.warning("The publishing agent could not access its queue. Retrying.")
 
     def refresh_buffer(self):
         with self.lock:

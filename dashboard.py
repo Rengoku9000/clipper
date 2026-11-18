@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from clipper import CLIP_PRESETS, DEFAULT_CLIP_PRESET
 from clipping_agent import ClippingAgent
+from credential_store import CredentialStore
 from publishing_agent import PublishingAgent
 from stream_monitoring_agent import StreamMonitoringAgent
 
@@ -43,21 +44,29 @@ class Dashboard:
                     remote TEXT, url TEXT, updated REAL NOT NULL,
                     PRIMARY KEY (clip, platform, account)
                 );
+                CREATE TABLE IF NOT EXISTS publishing_cursor (
+                    id INTEGER PRIMARY KEY CHECK (id = 1), event_id INTEGER NOT NULL
+                );
+                INSERT OR IGNORE INTO publishing_cursor SELECT 1, COALESCE(MAX(id), 0) FROM events;
                 UPDATE posts SET status='check', detail='Dashboard stopped during upload. Check the platform for this post.'
                 WHERE status='working';
-                UPDATE posts SET status='failed', detail='Dashboard stopped before upload. Review and submit the clip again.'
-                WHERE status='queued';
             """)
             fields = {column["name"] for column in db.execute("PRAGMA table_info(posts)")}
             if "buffer_asset" not in fields:
                 db.execute("ALTER TABLE posts ADD COLUMN buffer_asset TEXT")
             if "visibility" not in fields:
                 db.execute("ALTER TABLE posts ADD COLUMN visibility TEXT")
+            if "automatic" not in fields:
+                db.execute("ALTER TABLE posts ADD COLUMN automatic INTEGER NOT NULL DEFAULT 0")
+            db.execute("""UPDATE posts SET status='failed',
+                          detail='Dashboard stopped before upload. Review and submit the clip again.'
+                          WHERE status='queued' AND automatic=0""")
         self.clipping = ClippingAgent(options, ROOT, CLIPS, self.db)
         self.youtube_clipping = ClippingAgent(options, ROOT, CLIPS, self.db, platform="youtube")
         self.monitoring = StreamMonitoringAgent(self.clipping, self.db)
         self.youtube_monitoring = StreamMonitoringAgent(self.youtube_clipping, self.db)
-        self.publisher = PublishingAgent(self.url, self.db, self.clipping)
+        credentials = CredentialStore(DATA / "publishing-credentials.dpapi") if os.name == "nt" else None
+        self.publisher = PublishingAgent(self.url, self.db, self.clipping, credentials)
 
     @contextmanager
     def db(self):
