@@ -479,14 +479,25 @@ def publish(platform, account, path, title, description, visibility, made_for_ki
         "caption": f"{title}\n\n{description}".strip(),
     })["id"]
     record("Uploading video", container)
-    upload_binary("POST", f"https://rupload.facebook.com/ig-api-upload/{META_VERSION}/{container}",
-                  path, token, meta=True)
+    endpoint = f"https://rupload.facebook.com/ig-api-upload/{META_VERSION}/{container}"
+    try:
+        upload_binary("POST", endpoint, path, token, meta=True)
+    except PlatformHTTPError as error:
+        if error.status not in {400, 408, 500, 502, 503, 504}:
+            raise
+        record("Retrying Instagram video transfer", container)
+        time.sleep(3)
+        upload_binary("POST", endpoint, path, token, meta=True)
     record("Processing video", container)
+    return publish_instagram_container(identifier, container, token, record)
+
+
+def publish_instagram_container(identifier, container, token, record):
     for _ in range(30):
         status = graph("GET", container, token, params={"fields": "status_code"})["status_code"]
         if status == "FINISHED":
             break
-        if status in {"ERROR", "EXPIRED"}:
+        if status in {"ERROR", "EXPIRED", "PUBLISHED"}:
             raise RuntimeError(f"Instagram container status: {status.lower()}.")
         time.sleep(4)
     else:
