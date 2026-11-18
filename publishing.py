@@ -15,6 +15,10 @@ import requests
 PLATFORMS = ("youtube", "instagram", "facebook")
 GOOGLE_TOKEN = "https://oauth2.googleapis.com/token"
 GOOGLE_API = "https://www.googleapis.com/youtube/v3"
+YOUTUBE_SCOPES = (
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/youtube.readonly",
+)
 META_VERSION = "v27.0"
 META_API = f"https://graph.facebook.com/{META_VERSION}"
 META_PAGE_FIELDS = "id,name,access_token,instagram_business_account{id,username}"
@@ -22,6 +26,8 @@ META_CONTENT_TASKS = {
     "CREATE_CONTENT", "MANAGE", "PROFILE_PLUS_CREATE_CONTENT",
     "PROFILE_PLUS_FULL_CONTROL", "PROFILE_PLUS_MANAGE", "PROFILE_PLUS_FACEBOOK_ACCESS",
 }
+BUFFER_API = "https://api.buffer.com"
+CLOUDINARY_VIDEO_LIMIT = 100_000_000
 
 
 def call(method, url, *, token=None, oauth=False, headers=None, timeout=25, **kwargs):
@@ -43,6 +49,99 @@ def graph(method, path, token=None, **kwargs):
     return call(method, f"{META_API}/{path}", token=token, **kwargs).json()
 
 
+def buffer_graph(key, query, variables=None):
+    try:
+        response = call("POST", BUFFER_API, token=key, json={"query": query, "variables": variables or {}}).json()
+    except RuntimeError as error:
+        raise RuntimeError(f"Buffer request failed. {error}") from error
+    if response.get("errors") or not isinstance(response.get("data"), dict):
+        raise RuntimeError("Buffer could not complete the request. Check the API key and channel in Buffer.")
+    return response["data"]
+
+
+def buffer_channels(key):
+    account = buffer_graph(key, "query { account { organizations { id } } }")["account"]
+    channels = {}
+    for organization in account["organizations"]:
+        result = buffer_graph(key, """
+            query YoutubeChannels($org: OrganizationId!) {
+              channels(input: {organizationId: $org}) {
+                id service serviceId name displayName isDisconnected isLocked allowedActions
+              }
+            }
+        """, {"org": organization["id"]})
+        for channel in result["channels"]:
+            if (channel["service"] != "youtube" or channel["isDisconnected"] or channel["isLocked"]
+                    or "scheduleUpdates" not in channel["allowedActions"] or not channel["serviceId"]):
+                continue
+            identifier = channel["serviceId"]
+            channels[identifier] = {"id": identifier, "name": channel["displayName"] or channel["name"],
+                                    "via": "buffer", "buffer_channel": channel["id"]}
+    if not channels:
+        raise ValueError("Connect a YouTube channel in Buffer first and make sure this account can publish to it.")
+    return channels
+
+
+class BufferRejected(RuntimeError):
+    """Buffer explicitly rejected creating a post."""
+
+
+def create_buffer_post(account, url, title, description, visibility, made_for_kids):
+    result = buffer_graph(account["buffer_key"], """
+        mutation ShareYoutubeShort($post: CreatePostInput!) {
+          createPost(input: $post) {
+            __typename
+            ... on PostActionSuccess { post { id status externalLink } }
+          }
+        }
+    """, {"post": {
+        "channelId": account["buffer_channel"], "schedulingType": "automatic", "mode": "shareNow",
+        "needsApproval": False, "text": description, "assets": [{"video": {"url": url}}],
+        "metadata": {"youtube": {"title": title, "categoryId": "20", "privacy": visibility,
+                                  "madeForKids": made_for_kids, "notifySubscribers": False}},
+    }})["createPost"]
+    if result["__typename"] != "PostActionSuccess":
+        raise BufferRejected("Buffer rejected the post. Check the channel’s publishing limits and permissions.")
+    return result["post"]
+
+
+def read_buffer_post(account, remote):
+    return buffer_graph(account["buffer_key"], """
+        query CheckShort($id: PostId!) { post(input: {id: $id}) { id status externalLink } }
+    """, {"id": remote})["post"]
+
+
+def cloudinary_video(account, operation, public_id, path=None):
+    fields = {"public_id": public_id}
+    options = {}
+    if operation == "destroy":
+        fields["invalidate"] = "true"
+    else:
+        fields["overwrite"] = "false"
+    try:
+        if path is not None:
+            with path.open("rb") as stream:
+                options["files"] = {"file": ("clip.mp4", stream, "video/mp4")}
+                return call("POST", f"https://api.cloudinary.com/v1_1/{account['cloud_name']}/video/{operation}",
+                            auth=(account["cloud_key"], account["cloud_secret"]),
+                            data=fields, timeout=120, **options).json()
+        return call("POST", f"https://api.cloudinary.com/v1_1/{account['cloud_name']}/video/{operation}",
+                    auth=(account["cloud_key"], account["cloud_secret"]), data=fields, timeout=20).json()
+    except RuntimeError as error:
+        raise RuntimeError(f"Cloudinary request failed. {error}") from error
+
+
+def host_buffer_video(account, public_id, path):
+    if path.stat().st_size > CLOUDINARY_VIDEO_LIMIT:
+        raise ValueError("The clip exceeds the 100 MB limit for the free media handoff.")
+    url = cloudinary_video(account, "upload", public_id, path)["secure_url"]
+    parsed = urlparse(url)
+    if (parsed.scheme != "https" or parsed.hostname != "res.cloudinary.com"
+            or not parsed.path.startswith(f"/{account['cloud_name']}/video/upload/")):
+        raise RuntimeError("Cloudinary did not return a public video URL for the approved clip.")
+    return url
+
+
 class Accounts:
     def __init__(self, local_url):
         self.local_url = local_url
@@ -51,13 +150,19 @@ class Accounts:
         self.destinations = {}
         self.notice = ""
         self.meta_credentials = None
+        self.youtube_credentials = None
+        self.buffer_credentials = None
 
     def settings(self, provider):
         prefix = "CLIPPER_GOOGLE" if provider == "youtube" else "CLIPPER_META"
         identifier = os.getenv(f"{prefix}_CLIENT_ID")
         secret = os.getenv(f"{prefix}_CLIENT_SECRET")
         redirect = f"{self.local_url}/oauth/{provider}"
-        if provider == "meta":
+        if provider == "youtube":
+            redirect = f"http://127.0.0.1:{urlparse(self.local_url).port}/oauth/youtube"
+            if self.youtube_credentials:
+                identifier, secret = self.youtube_credentials
+        else:
             redirect = os.getenv("CLIPPER_META_REDIRECT_URI", redirect)
             if self.meta_credentials:
                 identifier, secret, _ = self.meta_credentials
@@ -65,6 +170,41 @@ class Accounts:
 
     def meta_config_id(self):
         return self.meta_credentials[2] if self.meta_credentials else os.getenv("CLIPPER_META_CONFIG_ID")
+
+    def configure_youtube(self, identifier, secret):
+        if not isinstance(identifier, str) or not isinstance(secret, str):
+            raise ValueError("Enter the Google OAuth Client ID and Client Secret.")
+        identifier, secret = identifier.strip(), secret.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,180}\.apps\.googleusercontent\.com", identifier):
+            raise ValueError("Enter a Google OAuth Client ID from a Desktop app client.")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{12,128}", secret):
+            raise ValueError("Enter the Client Secret from the same Google OAuth client.")
+        with self.lock:
+            if self.destinations.get("youtube"):
+                raise ValueError("Disconnect YouTube before changing the Google OAuth client.")
+            self.youtube_credentials = (identifier, secret)
+            self.states = {key: value for key, value in self.states.items() if value[0] != "youtube"}
+            self.notice = "Google OAuth settings loaded for this session. Connect YouTube to continue."
+
+    def configure_buffer(self, buffer_key, cloud_name, cloud_key, cloud_secret):
+        if not all(isinstance(value, str) for value in (buffer_key, cloud_name, cloud_key, cloud_secret)):
+            raise ValueError("Enter the Buffer API key and the three Cloudinary credentials.")
+        buffer_key, cloud_name, cloud_key, cloud_secret = (
+            value.strip() for value in (buffer_key, cloud_name, cloud_key, cloud_secret)
+        )
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", cloud_name) or not re.fullmatch(r"[0-9]{5,32}", cloud_key):
+            raise ValueError("Enter the Cloudinary cloud name and numeric API key.")
+        if not all(re.fullmatch(r"[!-~]{12,512}", value) for value in (buffer_key, cloud_secret)):
+            raise ValueError("Enter the Buffer API key and Cloudinary API secret.")
+        channels = buffer_channels(buffer_key)
+        with self.lock:
+            if any(account.get("via") != "buffer" for account in self.destinations.get("youtube", {}).values()):
+                raise ValueError("Disconnect direct YouTube OAuth before connecting Buffer.")
+            self.states = {key: value for key, value in self.states.items() if value[0] != "youtube"}
+            self.buffer_credentials = {"buffer_key": buffer_key, "cloud_name": cloud_name,
+                                       "cloud_key": cloud_key, "cloud_secret": cloud_secret}
+            self.destinations["youtube"] = channels
+            self.notice = "YouTube connected via Buffer. The media host will be verified on the first approved upload."
 
     def configure_meta(self, identifier, secret, config_id):
         if not all(isinstance(value, str) for value in (identifier, secret, config_id)):
@@ -91,9 +231,11 @@ class Accounts:
                 },
                 "meta_app": {"identifier": self.settings("meta")[0] or "",
                              "config_id": self.meta_config_id() or ""},
+                "youtube_app": {"identifier": self.settings("youtube")[0] or ""},
+                "buffer_available": True,
                 "redirects": {provider: self.settings(provider)[2] for provider in ("youtube", "meta")},
                 "destinations": {
-                    platform: [{key: account[key] for key in ("id", "name")}
+                    platform: [{key: account[key] for key in ("id", "name", "via") if key in account}
                                for account in accounts.values()]
                     for platform, accounts in self.destinations.items()
                 },
@@ -107,6 +249,8 @@ class Accounts:
         state = secrets.token_urlsafe(32)
         verifier = secrets.token_urlsafe(48)
         with self.lock:
+            if provider == "youtube" and self.buffer_credentials:
+                raise ValueError("Disconnect YouTube via Buffer before starting direct Google OAuth.")
             now = time.monotonic()
             self.states = {key: item for key, item in self.states.items() if item[2] > now}
             self.states[state] = (provider, verifier, now + 600)
@@ -115,7 +259,7 @@ class Accounts:
             endpoint = "https://accounts.google.com/o/oauth2/v2/auth"
             challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
             query.update({
-                "scope": "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly",
+                "scope": " ".join(YOUTUBE_SCOPES),
                 "code_challenge_method": "S256", "code_challenge": challenge.decode().rstrip("="),
                 "access_type": "offline", "prompt": "consent",
             })
@@ -136,6 +280,8 @@ class Accounts:
         if provider == "youtube":
             params.update(grant_type="authorization_code", code_verifier=request[1])
             token = call("POST", GOOGLE_TOKEN, data=params).json()
+            if "scope" in token and not set(YOUTUBE_SCOPES).issubset(token["scope"].split()):
+                raise ValueError("Google did not grant both YouTube permissions. Reconnect and select both permissions.")
             result = call("GET", f"{GOOGLE_API}/channels", token=token["access_token"],
                           params={"part": "snippet", "mine": "true"}).json()
             destinations = {"youtube": {
@@ -203,6 +349,8 @@ class Accounts:
             raise ValueError("Unknown platform.")
         with self.lock:
             self.destinations.pop(platform, None)
+            if platform == "youtube":
+                self.buffer_credentials = None
             self.notice = "Destination disconnected from this dashboard."
 
     def get(self, platform, identifier):
@@ -210,6 +358,8 @@ class Accounts:
             account = self.destinations.get(platform, {}).get(identifier)
             if not account:
                 raise ValueError("Connect and select a publishing destination first.")
+            if account.get("via") == "buffer":
+                return {**account, **self.buffer_credentials}
             if platform == "youtube" and time.time() >= account["expires"] - 60:
                 if not account["refresh"]:
                     raise ValueError("Reconnect your YouTube account to refresh access.")

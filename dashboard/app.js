@@ -109,7 +109,7 @@ function chart() {
 function workflowSnapshot() {
   const rendering = state.sessions.reduce((total, session) => total + session.rendering, 0);
   const values = [
-    ["radio", "Capture", "Streams being monitored", state.sessions.length],
+    ["radio", "Capture", "Active capture sessions", state.sessions.length],
     ["bolt", "Detect", "Highlights registered", state.counts.marked || 0],
     ["film", "Render", rendering ? `${rendering} currently rendering` : "Vertical clips in the library", state.clips.length],
     ["send", "Publish", "Accepted by platform", state.posts.filter(post => post.status === "published").length],
@@ -120,6 +120,25 @@ function workflowSnapshot() {
     `<a class="text-link" href="#workflow">View workflow ${icon("arrow")}</a>`);
 }
 
+function agentStatus() {
+  if (!state.agents) return "";
+  const {clipping, monitoring, publishing, youtube_clipping: youtubeClipping, youtube_monitoring: youtubeMonitor} = state.agents;
+  return `<section class="agent-grid" aria-label="Workflow agents">
+    <div class="panel capture-card"><div class="capture-top">
+      <h3>${icon("scissors")} Twitch Clipping Agent</h3>${chip(clipping.active ? "Capturing" : "Idle", clipping.active ? "good" : "")}
+    </div><p>${clipping.active} active captures · Exports clips for review</p></div>
+    ${monitoring ? `<div class="panel capture-card"><div class="capture-top">
+      <h3>${icon("radio")} Stream Monitoring Agent</h3>${chip(monitoring.active ? "Watching" : "Idle", monitoring.active ? "good" : "")}
+    </div><p>${number.format(monitoring.active)} Twitch streams being watched</p></div>` : ""}
+    ${youtubeClipping ? `<div class="panel capture-card"><div class="capture-top">
+      <h3>${icon("youtube")} YouTube Clipping Agent</h3>${chip(youtubeClipping.active ? "Capturing" : "Idle", youtubeClipping.active ? "good" : "")}
+    </div><p>${number.format(youtubeMonitor.active)} YouTube streams being watched</p></div>` : ""}
+    <div class="panel capture-card"><div class="capture-top">
+      <h3>${icon("send")} Publishing Agent</h3>${chip(publishing.online ? "Online" : "Offline", publishing.online ? "good" : "bad")}
+    </div><p>${publishing.queued} queued · ${publishing.active} uploading</p></div>
+  </section>`;
+}
+
 function clipName(clip) {
   return clip.channel === "Local" ? clip.name.replace(/\.mp4$/i, "").replaceAll("-", " ") : clip.channel;
 }
@@ -127,6 +146,8 @@ function clipName(clip) {
 function postLabel(status) {
   return ({
     published: ["Accepted", "good"], uploaded: ["Uploaded", "good"], working: ["Working", "purple"],
+    queued: ["Queued", "purple"],
+    buffer_pending: ["In Buffer", "purple"],
     check: ["Check platform", "warn"], failed: ["Failed", "bad"],
   })[status] || [status, ""];
 }
@@ -153,22 +174,39 @@ function overview() {
     ["Clips exported", number.format(ready), `${state.clips.filter(clip => clip.cues > 0).length} with captions`, "film"],
     ["Avg. time to clip", seconds(state.average_latency), "From highlight mark to export", "timer"],
     ["Connected accounts", number.format(connected), "YouTube, Instagram and Facebook", "link"],
-  ]) + `<div class="overview-grid">${chart()}${workflowSnapshot()}</div>` +
+  ]) + agentStatus() + `<div class="overview-grid">${chart()}${workflowSnapshot()}</div>` +
     panel("Recent clips", "", clipTable(state.clips.slice(0, 5)),
       `<a class="text-link" href="#library">Open library ${icon("arrow")}</a>`);
 }
 
 function captureCard(session) {
+  const platform = session.platform || "twitch";
+  const youtube = platform === "youtube";
   return `<section class="panel capture-card"><div class="capture-top"><h3>${icon("radio")} ${escape(session.channel)}
-    ${chip(session.status, session.status === "Capturing" ? "good" : "warn")}${session.rehearsal ? chip("Rehearsal") : ""}</h3>
+    ${chip(youtube ? "YouTube Live" : "Twitch")}${chip(session.status, session.status === "Capturing" ? "good" : "warn")}${session.rehearsal ? chip("Rehearsal") : ""}</h3>
     <div class="controls">
-      <button class="primary" data-mark="${escape(session.channel)}"${session.ready ? "" : " disabled"}>${icon("bolt")} Mark highlight</button>
-      <button class="secondary danger" data-stop="${escape(session.channel)}"${session.status === "Stopping" ? " disabled" : ""}>Stop</button>
+      <button class="primary" data-platform="${platform}" data-mark="${escape(session.channel)}"${session.ready ? "" : " disabled"}>${icon("bolt")} Mark highlight</button>
+      <button class="secondary danger" data-platform="${platform}" data-stop="${escape(session.channel)}"${session.status === "Stopping" ? " disabled" : ""}>Stop</button>
     </div></div><div class="capture-grid">
       <div>Rolling buffer<b>${seconds(session.buffer)}</b></div><div>Footage captured<b>${seconds(session.captured)}</b></div>
       <div>Waiting for post-roll<b>${session.waiting}</b></div><div>Rendering<b>${session.rendering}</b></div>
-    </div><p>${session.highlights} highlights · Chat detection ${session.chat ? "on" : "off"}</p>
-    ${session.logs.length ? `<details data-log="${escape(session.channel)}"><summary>Capture log</summary><pre>${escape(session.logs.join("\n"))}</pre></details>` : ""}</section>`;
+    </div><p>${session.highlights} highlights · ${youtube ? "Manual highlights" : `Chat detection ${session.chat ? "on" : "off"}`}</p>
+    ${session.logs.length ? `<details data-log="${platform}:${escape(session.channel)}"><summary>Capture log</summary><pre>${escape(session.logs.join("\n"))}</pre></details>` : ""}</section>`;
+}
+
+function streamMonitor(monitor, youtube = false) {
+  if (!monitor) return "";
+  const platform = youtube ? "YouTube Live" : "Twitch";
+  const rows = [...monitor.streams, ...monitor.history].map(stream => {
+    const tone = {Watching: "good", Starting: "warn", Stopping: "warn", "No recent video": "warn", Failed: "bad", Interrupted: "warn"}[stream.status];
+    const label = youtube ? `<a class="text-link" href="https://www.youtube.com/watch?v=${encodeURIComponent(stream.channel)}" target="_blank" rel="noopener">${escape(stream.channel)}</a>` : escape(stream.channel);
+    return `<tr><th scope="row">${label}</th><td>${chip(stream.status, tone)}</td>
+      <td>${time(stream.started)}</td><td>${stream.ended == null ? "—" : time(stream.ended)}</td></tr>`;
+  }).join("");
+  return panel(`${platform} stream monitor`, `${number.format(monitor.active)} streams being watched · Latest 20 past captures`, rows ?
+    `<div class="table-wrap"><table><thead><tr><th scope="col">${youtube ? "Video ID" : "Channel"}</th><th scope="col">Status</th>
+      <th scope="col">Started</th><th scope="col">Ended</th></tr></thead><tbody>${rows}</tbody></table></div>` :
+    `<div class="empty">Start a ${platform} capture to track it here.</div>`);
 }
 
 function chatTable() {
@@ -180,9 +218,9 @@ function chatTable() {
 
 function workflow() {
   const captures = state.sessions.map(captureCard).join("") ||
-    '<div class="panel empty">No active captures. Start a Twitch session to see its buffer and render queue here.</div>';
+    '<div class="panel empty">No active captures. Start a session to see its buffer and render queue here.</div>';
   const activity = state.activity.map(item => {
-    const info = [item.channel];
+    const info = [item.data.platform === "youtube" ? `YouTube Live · ${item.channel}` : item.channel];
     if (item.data.trigger) info.push(item.data.trigger === "spike" ? "Chat spike" : "Manual mark");
     if (item.data.latency != null) info.push(`${seconds(item.data.latency)} to export`);
     if (item.data.message) info.push(item.data.message);
@@ -194,7 +232,7 @@ function workflow() {
     ["Highlights marked", count("marked"), "Manual and chat-triggered", "bolt"],
     ["Renders completed", count("ready"), "Recorded by this dashboard", "film"],
     ["Workflow failures", count("failed") + count("capture_failed"), "Capture and rendering errors", "activity"],
-  ]) + `<div class="stack">${captures}${panel("Chat activity", "Latest 10-second windows", chatTable())}
+  ]) + `<div class="stack">${streamMonitor(state.agents?.monitoring)}${streamMonitor(state.agents?.youtube_monitoring, true)}${captures}${panel("Chat activity", "Latest 10-second windows", chatTable())}
     ${panel("Activity log", "Latest workflow events", activity ? `<div class="activity">${activity}</div>` : '<div class="empty">No workflow events yet.</div>')}</div>`;
 }
 
@@ -220,7 +258,7 @@ function library() {
 function safeLink(url) {
   try {
     const link = new URL(url);
-    const allowed = ["www.youtube.com", "www.facebook.com", "www.instagram.com"];
+    const allowed = ["www.youtube.com", "youtube.com", "youtu.be", "www.facebook.com", "www.instagram.com"];
     return link.protocol === "https:" && allowed.includes(link.hostname) ? link.href : "";
   } catch {
     return "";
@@ -236,15 +274,17 @@ function publishing() {
       <td>${href ? `<a class="text-link" href="${escape(href)}" target="_blank" rel="noopener">Open post ${icon("arrow")}</a>` : "—"}</td></tr>`;
   }).join("");
   const count = status => state.posts.filter(post => post.status === status).length;
-  return heading("Publishing", "Track each upload separately by platform and destination.") + statRow([
+  const bufferReview = state.posts.some(post => post.buffer_asset && post.remote && ["buffer_pending", "check"].includes(post.status));
+  return heading("Publishing", "Track the Publishing Agent’s queue and results by destination.") + statRow([
     ["Accepted posts", count("published"), "Public requests accepted", "send"],
     ["Private / unlisted", count("uploaded"), "YouTube uploads", "film"],
-    ["In progress", count("working"), "Queued, uploading or processing", "timer"],
+    ["In progress", count("queued") + count("working") + count("buffer_pending"), "Queued, uploading or processing", "timer"],
     ["Needs attention", count("check") + count("failed"), "Failed or awaiting verification", "activity"],
   ]) + panel("Upload history", "", rows ? `<div class="table-wrap"><table><thead><tr><th>Clip</th><th>Platform</th>
     <th>Account</th><th>Status</th><th>Details</th><th>Updated</th><th>Post</th></tr></thead><tbody>${rows}</tbody></table></div>`
     : '<div class="empty">No uploads yet. Open a clip preview to choose a publishing destination.</div>',
-    '<a class="text-link" href="#library">Open clip library</a>');
+    bufferReview ? '<button class="secondary" data-refresh-buffer>Check Buffer status</button>' :
+      '<a class="text-link" href="#library">Open clip library</a>');
 }
 
 function accounts() {
@@ -252,14 +292,18 @@ function accounts() {
   const cards = Object.entries(platforms).map(([key, entry]) => {
     const linked = state.accounts.destinations[key] || [];
     const configured = state.accounts.configured[entry.provider];
+    const bufferLinked = linked.some(account => account.via === "buffer");
+    const useBuffer = key === "youtube" && state.accounts.buffer_available && !linked.length;
     const badge = linked.length ? chip("Connected", "good") : configured ? chip("Not connected") : chip("Setup needed", "warn");
     return `<section class="panel account-card"><div class="account-top"><span class="platform-icon ${key}">${icon(key)}</span>
         <div><h3>${entry.name}</h3><p>${entry.type}</p></div>${badge}</div>
-      ${linked.length ? `<ul>${linked.map(account => `<li>${escape(account.name)}</li>`).join("")}</ul>` : `<p>${entry.description}</p>`}
+      ${linked.length ? `<ul>${linked.map(account => `<li>${escape(account.name)}${account.via === "buffer" ? " · via Buffer" : ""}</li>`).join("")}</ul>` : `<p>${entry.description}</p>`}
       <div class="card-actions">
-        <button class="${linked.length ? "secondary" : "primary"}" ${configured ? `data-connect="${entry.provider}"` : `data-setup="${entry.provider}"`}>${icon("link")} ${linked.length ? "Reconnect" : configured ? `Connect ${entry.name}` : entry.provider === "meta" ? "Set up Meta" : "Setup instructions"}</button>
-        ${configured && entry.provider === "meta" && !metaLinked ?
-          '<button class="secondary" data-setup="meta">Setup</button>' : ""}
+        ${useBuffer || bufferLinked
+          ? `<button class="${linked.length ? "secondary" : "primary"}" data-setup="buffer">${icon("link")} ${bufferLinked ? "Reconnect Buffer" : "Set up Buffer"}</button>`
+          : `<button class="${linked.length ? "secondary" : "primary"}" ${configured ? `data-connect="${entry.provider}"` : `data-setup="${entry.provider}"`}>${icon("link")} ${linked.length ? "Reconnect" : configured ? `Connect ${entry.name}` : entry.provider === "meta" ? "Set up Meta" : "Set up YouTube"}</button>`}
+        ${useBuffer ? `<button class="secondary" ${configured ? 'data-connect="youtube"' : 'data-setup="youtube"'}>Direct Google OAuth</button>` :
+          configured && entry.provider === "meta" && !metaLinked ? '<button class="secondary" data-setup="meta">Setup</button>' : ""}
         ${linked.length ? `<button class="secondary" data-disconnect="${key}">Disconnect</button>` : ""}
       </div></section>`;
   }).join("");
@@ -341,13 +385,14 @@ function startDialog() {
   const presets = (state.clip_presets || []).map(preset =>
     `<option value="${escape(preset.id)}"${preset.default ? " selected" : ""}>
     ${escape(preset.label)} · ${preset.before + preset.after}s</option>`).join("");
-  showDialog("Start capture", `<form id="capture-form"><label>Twitch channel<input name="channel" required
+  showDialog("Start capture", `<form id="capture-form">${state.agents?.youtube_clipping ? '<label>Stream platform<select name="platform"><option value="twitch">Twitch</option><option value="youtube">YouTube Live</option></select></label>' : ""}
+    <label><span data-source-label>Twitch channel</span><input name="channel" required
     pattern="[a-zA-Z0-9_]{1,25}" placeholder="Channel login" autocomplete="off" autofocus></label>
-    ${state.top_caption_enabled ? '<label>Top caption<input name="top_caption" maxlength="56" placeholder="Defaults to the channel name"></label>' : ""}
+    ${state.top_caption_enabled ? '<label>Top caption<input name="top_caption" maxlength="56" placeholder="Generated from speech if left blank"></label>' : ""}
     ${presets ? `<label>Clip length<select name="clip_preset">${presets}</select></label>` : ""}
-    <label class="check"><input type="checkbox" name="chat"${state.chat_configured ? "" : " disabled"}>
+    <label class="check" data-twitch-option><input type="checkbox" name="chat"${state.chat_configured ? "" : " disabled"}>
       <span>Detect chat spikes${state.chat_configured ? "" : "<br><small>Twitch OAuth is required for automatic detection.</small>"}</span></label>
-    ${state.rehearsal ? '<label class="check"><input type="checkbox" name="rehearsal"><span>Use the local rehearsal recording<br><small>Rehearsal clips are 8 seconds.</small></span></label>' : ""}
+    ${state.rehearsal ? '<label class="check" data-twitch-option><input type="checkbox" name="rehearsal"><span>Use the local rehearsal recording<br><small>Rehearsal clips are 8 seconds.</small></span></label>' : ""}
     <p class="dialog-error" role="alert" hidden></p><div class="dialog-foot"><button type="button" class="secondary" data-close>Cancel</button><button class="primary">Start capture</button></div></form>`);
 }
 
@@ -366,7 +411,7 @@ function publishDialog(id) {
   if (!clip) return;
   const options = Object.entries(platforms).flatMap(([key, platform]) =>
     (state.accounts.destinations[key] || []).map(account => ({
-      value: `${key}:${account.id}`, label: `${platform.name} · ${account.name}`,
+      value: `${key}:${account.id}`, label: `${platform.name} · ${account.name}${account.via === "buffer" ? " via Buffer" : ""}`,
     })));
   if (!options.length) {
     showDialog("Connect a publishing account", '<p>Connect YouTube, Instagram or a Facebook Page to publish this clip.</p><div class="dialog-foot"><a class="button primary" href="#accounts" data-close>Go to accounts</a></div>');
@@ -374,13 +419,14 @@ function publishDialog(id) {
   }
   showDialog("Publish clip", `<form id="publish-form" data-clip="${escape(id)}">
     <label>Destination<select name="destination">${options.map(item => `<option value="${escape(item.value)}">${escape(item.label)}</option>`).join("")}</select></label>
-    <label>Title<input name="title" maxlength="100" required value="${escape(clipName(clip))}"></label>
-    <label>Description<textarea name="description" maxlength="2000"></textarea></label>
+    <label>Title<input name="title" maxlength="100" required value="${escape(clip.suggested_title || clipName(clip))}"></label>
+    <label>Post caption<textarea name="description" maxlength="2000">${escape(clip.suggested_description || "")}</textarea></label>
     <label id="visibility">YouTube visibility<select name="visibility"><option value="private">Private</option>
       <option value="unlisted">Unlisted</option><option value="public">Public</option></select></label>
     <label id="audience">YouTube audience<select name="audience" required><option value="" selected disabled>Select audience</option>
       <option value="no">No, this video isn’t made for kids</option><option value="yes">Yes, this video is made for kids</option></select></label>
     <p id="meta-public" hidden>Publishing to Instagram or Facebook creates a public Reel.</p>
+    <p id="buffer-handoff" hidden>Buffer retrieves the approved clip from a temporary public Cloudinary URL, including for private YouTube uploads.</p>
     <label class="check"><input name="confirmed" type="checkbox" required><span>I have permission to publish this clip and have reviewed the destination.</span></label>
     <p class="dialog-error" role="alert" hidden></p><div class="dialog-foot">
     <button type="button" data-preview="${escape(id)}" class="secondary">Back</button><button class="primary">Submit upload</button></div></form>`);
@@ -396,9 +442,24 @@ function setVisibility(destination) {
   audience.style.display = youtube ? "" : "none";
   audience.querySelector("select").disabled = !youtube;
   dialog.querySelector("#meta-public").hidden = youtube;
+  const id = destination.slice("youtube:".length);
+  dialog.querySelector("#buffer-handoff").hidden = !youtube ||
+    !(state.accounts.destinations.youtube || []).some(account => account.id === id && account.via === "buffer");
 }
 
 function setup(provider) {
+  if (provider === "buffer") {
+    showDialog("Set up Buffer for YouTube", `<form id="buffer-setup-form" autocomplete="off">
+      <p>Connect your YouTube channel in Buffer and use the Free plans for Buffer and Cloudinary. Paste the credentials here to load them for this session.</p>
+      <label>Buffer API key<input type="password" name="buffer_key" autocomplete="new-password" required></label>
+      <label>Cloudinary cloud name<input name="cloud_name" required></label>
+      <label>Cloudinary API key<input name="cloud_key" inputmode="numeric" required></label>
+      <label>Cloudinary API secret<input type="password" name="cloud_secret" autocomplete="new-password" required></label>
+      <p class="dialog-error" role="alert" hidden></p>
+      <div class="dialog-foot"><button type="button" class="secondary" data-close>Cancel</button><button class="primary">Connect Buffer</button></div>
+    </form>`);
+    return;
+  }
   if (provider === "meta") {
     const app = state.accounts.meta_app || {};
     showDialog("Set up Meta", `<form id="meta-setup-form" autocomplete="off">
@@ -407,6 +468,17 @@ function setup(provider) {
       <label>Configuration ID<input name="config_id" inputmode="numeric" required value="${escape(app.config_id)}"></label>
       <label>App Secret<input name="secret" type="password" autocomplete="new-password" required></label>
       <p>OAuth callback <span class="mono">${escape(state.accounts.redirects.meta)}</span></p>
+      <p class="dialog-error" role="alert" hidden></p>
+      <div class="dialog-foot"><button type="button" class="secondary" data-close>Cancel</button><button class="primary">Save setup</button></div>
+    </form>`);
+    return;
+  }
+  if (state.accounts.youtube_app) {
+    showDialog("Set up YouTube", `<form id="youtube-setup-form" autocomplete="off">
+      <p>Enable YouTube Data API v3 and create a Desktop OAuth client in Google Cloud. The secret is kept in memory for this dashboard session.</p>
+      <label>OAuth Client ID<input name="identifier" required value="${escape(state.accounts.youtube_app.identifier)}"></label>
+      <label>OAuth Client Secret<input name="secret" type="password" autocomplete="new-password" required></label>
+      <p>OAuth callback <span class="mono">${escape(state.accounts.redirects.youtube)}</span></p>
       <p class="dialog-error" role="alert" hidden></p>
       <div class="dialog-foot"><button type="button" class="secondary" data-close>Cancel</button><button class="primary">Save setup</button></div>
     </form>`);
@@ -445,9 +517,14 @@ document.addEventListener("click", async event => {
       await action("disconnect", { platform: data.disconnect });
       await refresh(true);
     }
+    if (Object.hasOwn(data, "refreshBuffer")) {
+      await action("refresh-buffer", {});
+      notify("Buffer status check queued.");
+      await refresh(true);
+    }
     if (data.mark || data.stop) {
       const channel = data.mark || data.stop;
-      await action(data.mark ? "mark" : "stop", { channel });
+      await action(data.mark ? "mark" : "stop", { channel, platform: data.platform });
       notify(data.mark ? `Highlight marked for ${channel}.` : `Stopping ${channel}.`);
       await refresh(true);
     }
@@ -473,6 +550,22 @@ document.addEventListener("change", event => {
     document.querySelector("#clip-results").innerHTML = filteredClips();
   }
   if (event.target.name === "destination") setVisibility(event.target.value);
+  if (event.target.name === "platform" && event.target.form?.id === "capture-form") {
+    const form = event.target.form;
+    const youtube = event.target.value === "youtube";
+    const source = form.elements.channel;
+    form.querySelector("[data-source-label]").textContent = youtube ? "YouTube Live video URL" : "Twitch channel";
+    source.type = youtube ? "url" : "text";
+    source.value = "";
+    source.placeholder = youtube ? "https://www.youtube.com/watch?v=…" : "Channel login";
+    if (youtube) source.removeAttribute("pattern");
+    else source.pattern = "[a-zA-Z0-9_]{1,25}";
+    form.querySelectorAll("[data-twitch-option]").forEach(label => {
+      label.hidden = youtube;
+      const input = label.querySelector("input");
+      input.disabled = youtube || (input.name === "chat" && !state.chat_configured);
+    });
+  }
 });
 dialog.addEventListener("submit", async event => {
   event.preventDefault();
@@ -484,7 +577,7 @@ dialog.addEventListener("submit", async event => {
   if (button) button.disabled = true;
   try {
     if (form.id === "capture-form") {
-      await action("start", { channel: data.channel, chat: data.chat === "on",
+      await action("start", { channel: data.channel.trim(), platform: data.platform, chat: data.chat === "on",
         rehearsal: data.rehearsal === "on", top_caption: data.top_caption || "",
         clip_preset: data.clip_preset || "highlight" });
       location.hash = "workflow";
@@ -493,6 +586,14 @@ dialog.addEventListener("submit", async event => {
       await action("configure-meta", data);
       form.reset();
       notify("Meta setup saved for this session. Connect Instagram to continue.");
+    } else if (form.id === "youtube-setup-form") {
+      await action("configure-youtube", data);
+      form.reset();
+      notify("YouTube setup saved for this session. Connect YouTube to continue.");
+    } else if (form.id === "buffer-setup-form") {
+      await action("configure-buffer", data);
+      form.reset();
+      notify("YouTube connected via Buffer.");
     } else {
       const [platform, account] = data.destination.split(":");
       const made_for_kids = data.audience ? data.audience === "yes" : null;

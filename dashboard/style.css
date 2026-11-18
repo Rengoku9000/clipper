@@ -73,6 +73,7 @@ p { color: var(--muted); line-height: 1.55; }
 .stat-value { color: var(--text); font-size: 32px; line-height: 1; font-weight: 650; letter-spacing: -.055em; font-variant-numeric: tabular-nums; }
 .stat small, .muted { color: var(--muted); }
 .overview-grid { display: grid; grid-template-columns: minmax(0, 1.8fr) minmax(270px, 1fr); gap: 15px; margin-bottom: 15px; }
+.agent-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 235px), 1fr)); gap: 15px; margin-bottom: 15px; }
 .chart-panel { display: flex; flex-direction: column; }
 select.chart-period { width: auto; min-height: 32px; color: var(--muted); font-size: 11px; padding: 6px 7px; border: 1px solid var(--stroke); border-radius: 5px; white-space: nowrap; }
 .chart { position: relative; height: 200px; margin: 4px 18px 15px; display: flex; align-items: end; gap: 9px; padding: 0 3px 23px; }
@@ -145,6 +146,7 @@ textarea { resize: vertical; min-height: 82px; }
 form { display: grid; gap: 13px; }
 label { display: grid; gap: 6px; color: var(--text); font-size: 13px; }
 .check { display: flex; align-items: start; gap: 8px; line-height: 1.4; }
+.check[hidden] { display: none; }
 input[type=checkbox] { margin-top: 3px; accent-color: var(--accent); }
 .check small { color: var(--muted); }
 dialog { width: min(500px, calc(100% - 24px)); max-height: calc(100% - 26px); padding: 21px; border: 1px solid #47445b; border-radius: 14px; background: var(--card); color: var(--text); }

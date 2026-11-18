@@ -3,30 +3,25 @@
 import argparse
 import json
 import os
-import re
 import shutil
 import sqlite3
 import subprocess
-import sys
-import threading
-import time
-from collections import deque
 from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from clipper import CLIP_PRESETS, DEFAULT_CLIP_PRESET, normalize_top_caption
-from publishing import Accounts, PLATFORMS, publish
+from clipper import CLIP_PRESETS, DEFAULT_CLIP_PRESET
+from clipping_agent import ClippingAgent
+from publishing_agent import PublishingAgent
+from stream_monitoring_agent import StreamMonitoringAgent
 
 
 ROOT = Path(__file__).resolve().parent
 CLIPS = ROOT / "clips"
 ASSETS = ROOT / "dashboard"
 DATA = ROOT / ".dashboard"
-EVENT_PREFIX = "CLIPPER_EVENT "
-CHANNEL = re.compile(r"[a-z0-9_]{1,25}", re.IGNORECASE)
 STATIC = {"/": ("index.html", "text/html"), "/app.js": ("app.js", "text/javascript"),
           "/style.css": ("style.css", "text/css")}
 
@@ -35,12 +30,6 @@ class Dashboard:
     def __init__(self, options):
         self.options = options
         self.url = f"http://localhost:{options.port}"
-        self.accounts = Accounts(self.url)
-        self.lock = threading.RLock()
-        self.capture_lock = threading.RLock()
-        self.sessions = {}
-        self.metadata = {}
-        self.publish_threads = set()
         DATA.mkdir(exist_ok=True)
         with self.db() as db:
             db.executescript("""
@@ -56,7 +45,19 @@ class Dashboard:
                 );
                 UPDATE posts SET status='check', detail='Dashboard stopped during upload. Check the platform for this post.'
                 WHERE status='working';
+                UPDATE posts SET status='failed', detail='Dashboard stopped before upload. Review and submit the clip again.'
+                WHERE status='queued';
             """)
+            fields = {column["name"] for column in db.execute("PRAGMA table_info(posts)")}
+            if "buffer_asset" not in fields:
+                db.execute("ALTER TABLE posts ADD COLUMN buffer_asset TEXT")
+            if "visibility" not in fields:
+                db.execute("ALTER TABLE posts ADD COLUMN visibility TEXT")
+        self.clipping = ClippingAgent(options, ROOT, CLIPS, self.db)
+        self.youtube_clipping = ClippingAgent(options, ROOT, CLIPS, self.db, platform="youtube")
+        self.monitoring = StreamMonitoringAgent(self.clipping, self.db)
+        self.youtube_monitoring = StreamMonitoringAgent(self.youtube_clipping, self.db)
+        self.publisher = PublishingAgent(self.url, self.db, self.clipping)
 
     @contextmanager
     def db(self):
@@ -68,165 +69,14 @@ class Dashboard:
         finally:
             db.close()
 
-    def event(self, channel, kind, data=None):
-        with self.db() as db:
-            db.execute("INSERT INTO events (time, channel, kind, data) VALUES (?, ?, ?, ?)",
-                       (time.time(), channel, kind, json.dumps(data or {})))
-
-    def clip_path(self, relative):
-        if not relative or not isinstance(relative, str):
-            raise ValueError("Select a clip.")
-        path = (CLIPS / relative).resolve()
-        if not path.is_relative_to(CLIPS) or path.suffix.lower() != ".mp4":
-            raise ValueError("Invalid clip path.")
-        if any(part.startswith((".", "tmp")) for part in path.relative_to(CLIPS).parts):
-            raise ValueError("The clip is still rendering.")
-        if not path.is_file():
-            raise ValueError("Clip file was not found.")
-        return path
-
-    def clip_stats(self, path):
-        stat = path.stat()
-        key = (stat.st_mtime_ns, stat.st_size)
-        with self.lock:
-            cached = self.metadata.get(path)
-        if cached and cached[0] == key:
-            return cached[1]
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height,r_frame_rate:format=duration",
-             "-of", "json", str(path)],
-            capture_output=True, text=True, timeout=8,
-        )
-        if result.returncode != 0:
-            raise ValueError("Clip could not be read.")
-        probe = json.loads(result.stdout)
-        details = probe["streams"][0]
-        details["duration"] = round(float(probe["format"]["duration"]), 2)
-        details["name"] = path.name
-        details["id"] = path.relative_to(CLIPS).as_posix()
-        details["size"] = stat.st_size
-        details["time"] = stat.st_mtime
-        details["channel"] = path.name.split("-", 1)[0] if re.search(r"-\d{8}-\d{6}-", path.name) else "Local"
-        with self.lock:
-            self.metadata[path] = key, details
-        return details
-
-    def library(self):
-        clips = []
-        for path in CLIPS.rglob("*.mp4"):
-            try:
-                path = self.clip_path(path.relative_to(CLIPS).as_posix())
-                item = self.clip_stats(path).copy()
-                subs = path.with_suffix(".srt")
-                item["cues"] = subs.read_text(encoding="utf-8").count(" --> ") if subs.exists() else 0
-                clips.append(item)
-            except (OSError, ValueError, IndexError, KeyError, subprocess.TimeoutExpired):
-                continue
-        return sorted(clips, key=lambda clip: clip["time"], reverse=True)
-
-    def start(self, channel, chat, rehearsal=False, top_caption="", clip_preset=DEFAULT_CLIP_PRESET):
-        if not isinstance(channel, str) or not CHANNEL.fullmatch(channel):
-            raise ValueError("Enter a Twitch channel login.")
-        channel = channel.lower()
-        top_caption = normalize_top_caption(top_caption)
-        if not isinstance(clip_preset, str) or clip_preset not in CLIP_PRESETS:
-            raise ValueError("Choose a clip length from the available presets.")
-        _, before, after = CLIP_PRESETS[clip_preset]
-        with self.capture_lock:
-            if channel in self.sessions:
-                raise ValueError("That channel is already running.")
-            if chat and not all(os.getenv(key) for key in ("TWITCH_CLIENT_ID", "TWITCH_USER_TOKEN")):
-                raise ValueError("Set the Twitch OAuth values before starting chat detection.")
-            command = [sys.executable, "-u", str(ROOT / "clipper.py"), "live", channel,
-                       "--quality", "720p60,480p30,best", "--output-dir", str(CLIPS / "dashboard" / channel),
-                       "--dashboard-events"]
-            if self.options.model:
-                command.extend(["--model", self.options.model])
-            if top_caption:
-                command.append(f"--top-caption={top_caption}")
-            if chat:
-                command.append("--chat")
-            if rehearsal:
-                if not self.options.rehearsal_input:
-                    raise ValueError("Configure a local rehearsal recording first.")
-                command.extend(["--input", str(self.options.rehearsal_input)])
-                before, after = 5, 3
-            command.extend(["--before", str(before), "--after", str(after)])
-            process = subprocess.Popen(
-                command, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-            )
-            session = {
-                "channel": channel, "time": time.time(), "status": "Starting", "buffer": 0,
-                "captured": 0, "ready": False, "waiting": 0, "rendering": 0, "highlights": 0,
-                "chat": chat, "rehearsal": rehearsal, "logs": deque(maxlen=16),
-                "process": process,
-            }
-            self.sessions[channel] = session
-            self.event(channel, "started", {"chat": chat, "rehearsal": rehearsal})
-            threading.Thread(target=self.watch, args=(session,), daemon=True).start()
-
-    def watch(self, session):
-        channel, process = session["channel"], session["process"]
-        with process.stdout:
-            for line in process.stdout:
-                line = line.strip()
-                with self.capture_lock:
-                    if not line.startswith(EVENT_PREFIX):
-                        if line:
-                            session["logs"].append(line)
-                        continue
-                    item = json.loads(line[len(EVENT_PREFIX):])
-                    kind = item.pop("event")
-                    if kind == "buffer":
-                        session.update(buffer=item["seconds"], captured=item["captured"], ready=item["ready"])
-                        if session["status"] != "Stopping":
-                            session["status"] = "Capturing"
-                        continue
-                    if kind == "marked":
-                        session["waiting"] += 1
-                        session["highlights"] += 1
-                    if kind == "rendering":
-                        session["waiting"] = max(0, session["waiting"] - 1)
-                        session["rendering"] += 1
-                    if kind in ("ready", "failed"):
-                        stage = "waiting" if kind == "failed" and item.get("stage") == "waiting" else "rendering"
-                        session[stage] = max(0, session[stage] - 1)
-                    if kind == "ready":
-                        item["clip"] = Path(item.pop("path")).relative_to(CLIPS).as_posix()
-                    self.event(channel, kind, item)
-        code = process.wait()
-        process.stdin.close()
-        with self.capture_lock:
-            stopping = session["status"] == "Stopping"
-            self.sessions.pop(channel, None)
-            detail = next(reversed(session["logs"]), "")
-            self.event(channel, "stopped" if stopping or code == 0 else "capture_failed",
-                       {"code": code, "message": detail})
-
-    def signal(self, channel, stop=False):
-        with self.capture_lock:
-            session = self.sessions.get(channel)
-            if not session or session["process"].poll() is not None:
-                raise ValueError("This capture is no longer running.")
-            if session["status"] == "Stopping" or (not stop and not session["ready"]):
-                raise ValueError("The capture is still starting or stopping.")
-            if stop:
-                session["status"] = "Stopping"
-                session["ready"] = False
-            session["process"].stdin.write("q\n" if stop else "\n")
-            session["process"].stdin.flush()
-
     def overview(self):
-        library = self.library()
-        with self.capture_lock:
-            sessions = [
-                {**{key: value for key, value in session.items() if key not in ("process", "logs")},
-                 "logs": list(session["logs"])}
-                for session in self.sessions.values()
-            ]
+        library = self.clipping.library()
+        with self.clipping.lock:
+            sessions = self.clipping.active_sessions()
+            monitoring = self.monitoring.snapshot()
+        with self.youtube_clipping.lock:
+            youtube_sessions = self.youtube_clipping.active_sessions()
+            youtube_monitoring = self.youtube_monitoring.snapshot()
         with self.db() as db:
             posts = [dict(row) for row in db.execute("SELECT * FROM posts ORDER BY updated DESC")]
             counts = {row["kind"]: row["count"] for row in
@@ -241,9 +91,14 @@ class Dashboard:
         for event in recent + chat:
             event["data"] = json.loads(event["data"])
         return {
-            "clips": library, "sessions": sessions, "posts": posts, "counts": counts,
+            "clips": library, "sessions": sessions + youtube_sessions, "posts": posts, "counts": counts,
+            "agents": {"clipping": {"active": len(sessions)}, "monitoring": monitoring,
+                       "youtube_clipping": {"active": len(youtube_sessions)}, "youtube_monitoring": youtube_monitoring,
+                       "publishing": {"online": self.publisher.worker.is_alive(),
+                                      "queued": sum(post["status"] == "queued" for post in posts),
+                                      "active": sum(post["status"] == "working" for post in posts)}},
             "activity": recent, "chat": chat, "average_latency": latency,
-            "accounts": self.accounts.summary(), "rehearsal": bool(self.options.rehearsal_input),
+            "accounts": self.publisher.accounts.summary(), "rehearsal": bool(self.options.rehearsal_input),
             "chat_configured": bool(os.getenv("TWITCH_CLIENT_ID") and os.getenv("TWITCH_USER_TOKEN")),
             "top_caption_enabled": True,
             "clip_presets": [
@@ -253,65 +108,12 @@ class Dashboard:
             ],
         }
 
-    def queue_post(self, data):
-        path = self.clip_path(data.get("clip"))
-        platform = data.get("platform")
-        account_id = data.get("account")
-        if platform not in PLATFORMS or not isinstance(account_id, str):
-            raise ValueError("Select a publishing destination.")
-        title = data.get("title", "").strip()
-        description = data.get("description", "").strip()
-        visibility = data.get("visibility", "private")
-        made_for_kids = data.get("made_for_kids")
-        if not title or len(title) > 100 or len(description) > 2000:
-            raise ValueError("Enter a title up to 100 characters and a description up to 2,000 characters.")
-        if visibility not in {"private", "unlisted", "public"} or data.get("confirmed") is not True:
-            raise ValueError("Confirm the selected destination and permissions before publishing.")
-        if platform == "youtube" and not isinstance(made_for_kids, bool):
-            raise ValueError("Select the YouTube audience for this clip.")
-        stats = self.clip_stats(path)
-        if (stats["width"], stats["height"]) != (1080, 1920) or not 4 <= stats["duration"] <= 60:
-            raise ValueError("Select a 4–60 second 1080 × 1920 clip for cross-platform compatibility.")
-        account = self.accounts.get(platform, account_id)
-        identifier = (path.relative_to(CLIPS).as_posix(), platform, account_id)
-        with self.db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            current = db.execute("SELECT status FROM posts WHERE clip=? AND platform=? AND account=?", identifier).fetchone()
-            if current and current["status"] != "failed":
-                raise ValueError("A publish attempt already exists for this clip and destination. Check Publishing.")
-            db.execute("INSERT OR REPLACE INTO posts VALUES (?, ?, ?, ?, 'working', ?, NULL, NULL, ?)",
-                       (*identifier, account["name"], "Queued", time.time()))
-        worker = threading.Thread(target=self.publish_worker,
-                                  args=(identifier, account, path, title, description, visibility, made_for_kids), daemon=True)
-        with self.lock:
-            self.publish_threads.add(worker)
-        worker.start()
-
-    def publish_worker(self, identifier, account, path, title, description, visibility, made_for_kids):
-        submitting = False
-
-        def record(detail, remote=None, status="working", url=None):
-            nonlocal submitting
-            submitting = submitting or detail.startswith("Submitting")
-            with self.db() as db:
-                db.execute("""UPDATE posts SET status=?, detail=?, remote=COALESCE(?, remote), url=?, updated=?
-                              WHERE clip=? AND platform=? AND account=?""",
-                           (status, detail, remote, url, time.time(), *identifier))
-
-        try:
-            remote, url = publish(identifier[1], account, path, title, description, visibility, made_for_kids, record)
-            status = "uploaded" if identifier[1] == "youtube" and visibility != "public" else "published"
-            record(f"Uploaded ({visibility})" if status == "uploaded" else "Accepted by platform",
-                   remote, status, url)
-        except Exception as error:
-            detail = str(error) if isinstance(error, RuntimeError) else "The upload could not be completed."
-            if submitting:
-                detail += " Check the platform for this clip before making another upload."
-            record(detail, status="check" if submitting else "failed")
-        finally:
-            with self.lock:
-                self.publish_threads.discard(threading.current_thread())
-
+    def clipper(self, platform):
+        if platform == "twitch":
+            return self.clipping
+        if platform == "youtube":
+            return self.youtube_clipping
+        raise ValueError("Choose Twitch or YouTube Live.")
 
 class Handler(BaseHTTPRequestHandler):
     @property
@@ -348,7 +150,7 @@ class Handler(BaseHTTPRequestHandler):
         params = parse_qs(target.query)
         if path in ("/oauth/youtube", "/oauth/meta"):
             provider = path.split("/")[-1]
-            configured = urlsplit(self.app.accounts.settings(provider)[2]).netloc
+            configured = urlsplit(self.app.publisher.accounts.settings(provider)[2]).netloc
             if self.local_host() or self.headers.get("Host") == configured:
                 return self.callback(provider, params)
         if not self.local_host():
@@ -360,7 +162,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/overview":
                 self.json(HTTPStatus.OK, self.app.overview())
             elif path in ("/clip", "/captions", "/thumbnail"):
-                video = self.app.clip_path(params.get("id", [""])[0])
+                video = self.app.clipping.clip_path(params.get("id", [""])[0])
                 if path == "/clip":
                     self.video(video)
                 elif path == "/captions":
@@ -390,19 +192,26 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Invalid request.")
             response = {"ok": True}
             if self.path == "/api/start":
-                self.app.start(data.get("channel"), data.get("chat") is True,
+                self.app.clipper(data.get("platform", "twitch")).start(data.get("channel"), data.get("chat") is True,
                                data.get("rehearsal") is True, data.get("top_caption", ""),
                                data.get("clip_preset", DEFAULT_CLIP_PRESET))
             elif self.path in ("/api/mark", "/api/stop"):
-                self.app.signal(data.get("channel"), self.path == "/api/stop")
+                self.app.clipper(data.get("platform", "twitch")).signal(data.get("channel"), self.path == "/api/stop")
             elif self.path == "/api/connect":
-                response["url"] = self.app.accounts.begin(data.get("provider"))
+                response["url"] = self.app.publisher.accounts.begin(data.get("provider"))
             elif self.path == "/api/configure-meta":
-                self.app.accounts.configure_meta(data.get("identifier"), data.get("secret"), data.get("config_id"))
+                self.app.publisher.accounts.configure_meta(data.get("identifier"), data.get("secret"), data.get("config_id"))
+            elif self.path == "/api/configure-youtube":
+                self.app.publisher.accounts.configure_youtube(data.get("identifier"), data.get("secret"))
+            elif self.path == "/api/configure-buffer":
+                self.app.publisher.accounts.configure_buffer(data.get("buffer_key"), data.get("cloud_name"),
+                                                             data.get("cloud_key"), data.get("cloud_secret"))
+            elif self.path == "/api/refresh-buffer":
+                self.app.publisher.refresh_buffer()
             elif self.path == "/api/disconnect":
-                self.app.accounts.disconnect(data.get("platform"))
+                self.app.publisher.accounts.disconnect(data.get("platform"))
             elif self.path == "/api/publish":
-                self.app.queue_post(data)
+                self.app.publisher.queue_post(data)
             else:
                 return self.json(HTTPStatus.NOT_FOUND, {"error": "Route not found."})
             self.json(HTTPStatus.OK, response)
@@ -412,9 +221,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def callback(self, provider, params):
         try:
-            self.app.accounts.finish(provider, params.get("state", [""])[0], params.get("code", [""])[0])
+            self.app.publisher.accounts.finish(provider, params.get("state", [""])[0], params.get("code", [""])[0])
         except (ValueError, RuntimeError, KeyError) as error:
-            self.app.accounts.notice = str(error) if not isinstance(error, KeyError) else "The provider did not return an eligible account."
+            self.app.publisher.accounts.notice = str(error) if not isinstance(error, KeyError) else "The provider did not return an eligible account."
         self.reply(HTTPStatus.SEE_OTHER, headers={"Location": f"{self.app.url}/#accounts"})
 
     def thumbnail(self, video):
@@ -469,27 +278,16 @@ def main():
         options.rehearsal_input = options.rehearsal_input.resolve()
         if not options.rehearsal_input.is_file():
             parser.error("Rehearsal input must be an existing file.")
-    app = Dashboard(options)
     with ThreadingHTTPServer(("127.0.0.1", options.port), Handler) as server:
+        app = Dashboard(options)
         server.app = app
         print(f"Clipper dashboard: {app.url}", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
-            with app.capture_lock:
-                active = list(app.sessions.values())
-            for session in active:
-                if session["status"] != "Stopping":
-                    try:
-                        app.signal(session["channel"], stop=True)
-                    except (ValueError, OSError):
-                        pass
-            for session in active:
-                session["process"].wait()
-            with app.lock:
-                posts = tuple(app.publish_threads)
-            for worker in posts:
-                worker.join()
+            app.clipping.close()
+            app.youtube_clipping.close()
+            app.publisher.close()
 
 
 if __name__ == "__main__":

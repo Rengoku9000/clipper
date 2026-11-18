@@ -19,10 +19,33 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 
 DEFAULT_CLIP_PRESET = "highlight"
+
+
+def youtube_video_id(value):
+    url = urlsplit(value)
+    path = url.path.split("/")
+    video_id = ""
+    if url.scheme == "https" and url.netloc.lower() == "youtu.be" and len(path) == 2:
+        video_id = path[1]
+    if url.scheme == "https" and url.netloc.lower() in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
+        if url.path == "/watch":
+            video_id = parse_qs(url.query).get("v", [""])[0]
+        elif len(path) == 3 and path[1] == "live":
+            video_id = path[2]
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        raise ValueError("Enter a YouTube Live video link or a Twitch channel login.")
+    return video_id
+
+
+def youtube_watch_url(video_id):
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
 CLIP_PRESETS = {
     "quick": ("Quick moment", 16, 9),
     "highlight": ("Gameplay highlight", 28, 17),
@@ -54,6 +77,22 @@ def normalize_top_caption(value):
     if len(value) > 56:
         raise ValueError("The top caption can be up to 56 characters.")
     return value
+
+
+def caption_copy(segments, target, fallback, channel=None, override="", source_url=None):
+    candidates = []
+    for segment in segments:
+        for sentence in re.split(r"(?<=[.!?。！？])\s+", " ".join(segment.text.split())):
+            if len(sentence) >= 18 and any(char.isalpha() for char in sentence):
+                midpoint = (segment.start + segment.end) / 2
+                candidates.append((abs(midpoint - target), sentence))
+    quote = min(candidates, key=lambda candidate: candidate[0])[1] if candidates else ""
+    short_quote = textwrap.shorten(quote, width=54, placeholder="…")
+    title = override or (f"“{short_quote}”" if short_quote and short_quote != "…" else fallback[:56])
+    description = f"“{textwrap.shorten(quote, width=360, placeholder='…')}”" if quote else ""
+    if channel:
+        description = "\n\n".join(filter(None, (description, f"Source: {source_url or f'twitch.tv/{channel}'}")))
+    return {"title": title, "description": description}
 
 
 class Renderer:
@@ -91,15 +130,8 @@ class Renderer:
                 "force_divisible_by=2:reset_sar=1[full];"
                 "[blur][full]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=30"
             )
-            default_caption = getattr(self.options, "channel", None) or source.stem.replace("_", " ").replace("-", " ")
-            top_caption = self.options.top_caption or default_caption[:56]
-            (work / "title.txt").write_text("\n".join(textwrap.wrap(top_caption, width=22)), encoding="utf-8")
-            layout += (
-                ",drawtext=textfile=title.txt:expansion=none:font=Arial:fontsize=50:"
-                "fontcolor=white:borderw=3:bordercolor=black@0.78:line_spacing=8:"
-                "x=(w-tw)/2:y=h*0.12"
-            )
             captions = ""
+            segments = []
             audio_stream = ""
             if not self.options.no_captions:
                 audio_stream = subprocess.check_output([
@@ -116,18 +148,37 @@ class Renderer:
                     "-map", "0:a:0", "-ac", "1", "-ar", "16000", "-f", "f32le", "pipe:1",
                 ], cwd=work, stdin=subprocess.DEVNULL)
                 audio = np.frombuffer(samples, dtype="<f4").copy()
-                segments, _ = self.model.transcribe(audio, vad_filter=True)
+                transcript, _ = self.model.transcribe(audio, vad_filter=True)
+                segments = [segment for segment in transcript if segment.text.strip()]
                 captions = "\n\n".join(
                     f"{index}\n{srt_time(segment.start)} --> {srt_time(segment.end)}\n"
                     f"{segment.text.strip()}"
                     for index, segment in enumerate(segments, start=1)
                 )
-                if captions:
-                    (work / "captions.srt").write_text(captions + "\n", encoding="utf-8")
-                    layout += (
-                        ",subtitles=captions.srt:"
-                        "force_style='FontSize=8,Outline=1.4,Shadow=0,MarginV=31,MarginL=22,MarginR=22'"
-                    )
+            channel = getattr(self.options, "channel", None)
+            fallback = channel or source.stem.replace("_", " ").replace("-", " ")
+            target = getattr(self.options, "before", duration / 2)
+            copy = caption_copy(segments, target, fallback, channel, self.options.top_caption,
+                                getattr(self.options, "source_url", None))
+            (work / "title.txt").write_text("\n".join(textwrap.wrap(copy["title"], width=22)), encoding="utf-8")
+            (work / "caption-copy.json").write_text(json.dumps(copy, ensure_ascii=False), encoding="utf-8")
+            title_font = "font=Arial Bold"
+            windows_bold = Path(os.environ.get("WINDIR", "")) / "Fonts" / "arialbd.ttf"
+            if windows_bold.is_file():
+                shutil.copyfile(windows_bold, work / "title-font.ttf")
+                title_font = "fontfile=title-font.ttf"
+            layout += (
+                f",drawtext=textfile=title.txt:expansion=none:{title_font}:fontsize=50:"
+                "fontcolor=0xFFD577:borderw=2:bordercolor=0x121018@0.85:"
+                "line_spacing=-22:text_align=C:"
+                "x=(w-tw)/2:y=h*0.12"
+            )
+            if captions:
+                (work / "captions.srt").write_text(captions + "\n", encoding="utf-8")
+                layout += (
+                    ",subtitles=captions.srt:"
+                    "force_style='FontSize=8,Bold=-1,Outline=1.4,Shadow=0,MarginV=31,MarginL=22,MarginR=22'"
+                )
             partial = output.with_name(f".{output.stem}-{uuid4().hex}.mp4")
             try:
                 run([
@@ -136,9 +187,12 @@ class Renderer:
                     "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "48000",
                     "-b:a", "128k", "-movflags", "+faststart", str(partial),
                 ], work)
-                partial.replace(output)
                 if captions:
-                    output.with_suffix(".srt").write_text(captions + "\n", encoding="utf-8")
+                    (work / "captions.srt").replace(output.with_suffix(".srt"))
+                else:
+                    output.with_suffix(".srt").unlink(missing_ok=True)
+                (work / "caption-copy.json").replace(output.with_suffix(".captions.json"))
+                partial.replace(output)
             finally:
                 partial.unlink(missing_ok=True)
             print(f"Ready for review: {output}", flush=True)
@@ -311,7 +365,7 @@ def capture(options, renderer):
         buffer = Buffer(work)
         stream_command = [
             sys.executable, "-m", "streamlink", "--stdout",
-            f"https://www.twitch.tv/{options.channel}", options.quality,
+            options.source_url, options.quality,
         ]
         if options.input:
             stream_command = [
@@ -431,7 +485,7 @@ def main():
     _, default_before, default_after = CLIP_PRESETS[DEFAULT_CLIP_PRESET]
     render.add_argument("--duration", type=float, default=default_before + default_after)
 
-    live = commands.add_parser("live", help="Capture and clip one Twitch channel")
+    live = commands.add_parser("live", help="Capture a Twitch channel or YouTube Live video")
     live.add_argument("channel")
     live.add_argument("--input", type=Path, help="Loop a local recording in real time for rehearsal")
     live.add_argument("--quality", default="best")
@@ -457,8 +511,13 @@ def main():
                 parser.error("Use a different file for the output")
             renderer.render(options.source, options.start, options.duration, options.output)
         else:
-            if not re.fullmatch(r"[a-zA-Z0-9_]{1,25}", options.channel):
-                parser.error("Use a Twitch login as the channel name")
+            if re.fullmatch(r"[a-zA-Z0-9_]{1,25}", options.channel):
+                options.source_url = f"https://www.twitch.tv/{options.channel}"
+            else:
+                options.channel = youtube_video_id(options.channel)
+                options.source_url = youtube_watch_url(options.channel)
+                if options.chat or options.input:
+                    parser.error("Use manual highlights for YouTube Live captures")
             if options.before <= 0 or options.after <= 0 or options.before + options.after > 120:
                 parser.error("Pre-roll and post-roll must be positive and total at most 120 seconds")
             capture(options, renderer)
