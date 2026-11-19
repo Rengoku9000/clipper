@@ -497,7 +497,14 @@ def publish(platform, account, path, title, description, visibility, made_for_ki
             raise
         record("Retrying Instagram video transfer", container)
         time.sleep(3)
-        upload_binary("POST", endpoint, path, token, meta=True)
+        status = graph("GET", container, token, params={"fields": "status_code"})["status_code"]
+        if status != "FINISHED":
+            try:
+                upload_binary("POST", endpoint, path, token, meta=True)
+            except PlatformHTTPError:
+                status = graph("GET", container, token, params={"fields": "status_code"})["status_code"]
+                if status != "FINISHED":
+                    raise
     record("Processing video", container)
     return publish_instagram_container(identifier, container, token, record)
 
@@ -513,7 +520,8 @@ def publish_instagram_container(identifier, container, token, record):
     else:
         raise RuntimeError("Instagram is still processing the video.")
     record("Submitting Reel", container)
-    remote = graph("POST", f"{identifier}/media_publish", token, data={"creation_id": container})["id"]
+    remote = graph("POST", f"{identifier}/media_publish", token,
+                   data={"creation_id": container}, timeout=90)["id"]
     try:
         link = graph("GET", remote, token, params={"fields": "permalink"}).get("permalink")
     except RuntimeError:

@@ -13,10 +13,11 @@ from publishing import (Accounts, BufferRejected, CloudinaryAuthorizationError, 
 
 
 class PublishingAgent:
-    def __init__(self, url, db, clips, credential_store=None):
+    def __init__(self, url, db, clips, credential_store=None, filtering=None):
         self.accounts = Accounts(url, credential_store)
         self.db = db
         self.clips = clips
+        self.filtering = filtering
         self.lock = threading.Lock()
         self.jobs = Queue()
         self.worker = threading.Thread(target=self.run, name="publishing-agent", daemon=True)
@@ -54,7 +55,7 @@ class PublishingAgent:
                 db.execute("BEGIN IMMEDIATE")
                 current = db.execute("SELECT status FROM posts WHERE clip=? AND platform=? AND account=?",
                                      identifier).fetchone()
-                if current and current["status"] != "failed":
+                if current and current["status"] not in {"failed", "held"}:
                     raise ValueError("A publish attempt already exists for this clip and destination. Check Publishing.")
                 db.execute("""INSERT OR REPLACE INTO posts
                               (clip, platform, account, name, status, detail, updated, visibility)
@@ -67,10 +68,22 @@ class PublishingAgent:
         if (stats["width"], stats["height"]) != (1080, 1920) or not 4 <= stats["duration"] <= 60:
             raise ValueError("Select a 4–60 second 1080 × 1920 clip for cross-platform compatibility.")
 
+    def platform_settings(self):
+        with self.db() as db:
+            return {row["platform"]: bool(row["enabled"]) for row in
+                    db.execute("SELECT platform, enabled FROM publishing_platforms")}
+
+    def set_platform(self, platform, enabled):
+        if platform not in PLATFORMS or not isinstance(enabled, bool):
+            raise ValueError("Choose a publishing platform and its on/off setting.")
+        with self.lock, self.db() as db:
+            db.execute("UPDATE publishing_platforms SET enabled=? WHERE platform=?", (enabled, platform))
+
     def next_automatic_post(self):
         destinations = self.accounts.summary()["destinations"]
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
+            enabled = {row["platform"] for row in db.execute("SELECT platform FROM publishing_platforms WHERE enabled=1")}
             clips = db.execute("""
                 SELECT id, time, json_extract(data, '$.clip') AS clip FROM events
                 WHERE id > (SELECT event_id FROM publishing_cursor WHERE id=1)
@@ -81,12 +94,14 @@ class PublishingAgent:
                 db.executemany("""INSERT OR IGNORE INTO posts
                     (clip, platform, account, name, status, detail, updated, visibility, automatic)
                     VALUES (?, ?, '', '', 'waiting', 'Connect one account for this platform.', ?, 'public', 1)
-                """, [(clip["clip"], platform, clip["time"]) for platform in PLATFORMS])
+                """, [(clip["clip"], platform, clip["time"]) for platform in PLATFORMS if platform in enabled])
             if clips:
                 db.execute("UPDATE publishing_cursor SET event_id=? WHERE id=1", (clips[-1]["id"],))
 
             queued = db.execute("""SELECT clip, platform, account FROM posts
-                WHERE automatic=1 AND status='queued' ORDER BY updated LIMIT 1""").fetchone()
+                WHERE automatic=1 AND status='queued'
+                  AND platform IN (SELECT platform FROM publishing_platforms WHERE enabled=1)
+                ORDER BY updated LIMIT 1""").fetchone()
             if queued:
                 return tuple(queued)
 
@@ -94,7 +109,8 @@ class PublishingAgent:
             db.execute("""DELETE FROM posts AS waiting WHERE waiting.status='waiting' AND waiting.automatic=1
                 AND EXISTS (SELECT 1 FROM posts AS submitted WHERE submitted.clip=waiting.clip
                     AND submitted.platform=waiting.platform AND submitted.account<>'' AND submitted.status<>'failed')""")
-            eligible = {platform: accounts[0] for platform, accounts in destinations.items() if len(accounts) == 1}
+            eligible = {platform: accounts[0] for platform, accounts in destinations.items()
+                        if len(accounts) == 1 and platform in enabled}
             if not eligible:
                 return None
             slots = ",".join("?" for _ in eligible)
@@ -167,6 +183,15 @@ class PublishingAgent:
         self.worker.join()
 
     def publish_job(self, identifier, path, fingerprint, title, description, visibility, made_for_kids):
+        with self.lock, self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            post = db.execute("SELECT automatic FROM posts WHERE clip=? AND platform=? AND account=?", identifier).fetchone()
+            if post and post["automatic"]:
+                enabled = db.execute("SELECT enabled FROM publishing_platforms WHERE platform=?", (identifier[1],)).fetchone()
+                if not enabled or not enabled["enabled"]:
+                    return
+                db.execute("UPDATE posts SET status='working', detail='Starting upload', updated=? WHERE clip=? AND platform=? AND account=?",
+                           (time.time(), *identifier))
         submitting = False
         buffer_asset = None
 
@@ -183,6 +208,21 @@ class PublishingAgent:
             stat = path.stat()
             if (stat.st_mtime_ns, stat.st_size) != fingerprint:
                 raise ValueError("The clip changed after approval. Review it again before publishing.")
+            record("Filtering Agent is screening this clip", status="screening")
+            if self.filtering is None:
+                record("Filtering Agent unavailable. Clip held for review.", status="held")
+                return
+            passed, reason = self.filtering.screen(path, title, description)
+            if not passed:
+                record(reason, status="held")
+                return
+            stat = path.stat()
+            if (stat.st_mtime_ns, stat.st_size) != fingerprint:
+                record("Clip changed during screening. Clip held for review.", status="held")
+                return
+            if self.platform_settings().get(identifier[1]) is False and post and post["automatic"]:
+                record("Automatic publishing paused", status="queued")
+                return
             account = self.accounts.get(identifier[1], identifier[2])
             record("Starting upload")
             if account.get("via") == "buffer":

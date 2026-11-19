@@ -16,9 +16,12 @@ from urllib.parse import parse_qs, urlsplit
 from clipper import CLIP_PRESETS, DEFAULT_CLIP_PRESET
 from clipping_agent import ClippingAgent
 from credential_store import CredentialStore
+from filtering_agent import FilteringAgent
 from publishing_agent import PublishingAgent
 from stream_monitoring_agent import StreamMonitoringAgent
 from twitch_chat_auth import configured as twitch_chat_configured
+from youtube_chat import api_key as youtube_chat_key, configure as configure_youtube_chat
+from youtube_capture import cookies as youtube_session_cookies, configure as configure_youtube_session
 
 
 ROOT = Path(__file__).resolve().parent
@@ -49,6 +52,17 @@ class Dashboard:
                 CREATE TABLE IF NOT EXISTS publishing_cursor (
                     id INTEGER PRIMARY KEY CHECK (id = 1), event_id INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS publishing_platforms (
+                    platform TEXT PRIMARY KEY, enabled INTEGER NOT NULL CHECK(enabled IN (0, 1))
+                );
+                CREATE TABLE IF NOT EXISTS screenings (
+                    clip TEXT PRIMARY KEY, signature TEXT NOT NULL, status TEXT NOT NULL,
+                    reason TEXT NOT NULL, updated REAL NOT NULL
+                );
+                UPDATE screenings SET status='error', reason='Screening interrupted. Clip held for review.'
+                    WHERE status='scanning';
+                UPDATE posts SET status='queued', detail='Waiting for screening' WHERE status='screening';
+                INSERT OR IGNORE INTO publishing_platforms VALUES ('youtube', 1), ('instagram', 1), ('facebook', 1);
                 INSERT OR IGNORE INTO publishing_cursor SELECT 1, COALESCE(MAX(id), 0) FROM events;
                 UPDATE posts SET status='check', detail='Dashboard stopped during upload. Check the platform for this post.'
                 WHERE status='working';
@@ -68,7 +82,8 @@ class Dashboard:
         self.monitoring = StreamMonitoringAgent(self.clipping, self.db)
         self.youtube_monitoring = StreamMonitoringAgent(self.youtube_clipping, self.db)
         credentials = CredentialStore(DATA / "publishing-credentials.dpapi") if os.name == "nt" else None
-        self.publisher = PublishingAgent(self.url, self.db, self.clipping, credentials)
+        self.filtering = FilteringAgent(self.clipping, self.db)
+        self.publisher = PublishingAgent(self.url, self.db, self.clipping, credentials, self.filtering)
 
     @contextmanager
     def db(self):
@@ -105,12 +120,16 @@ class Dashboard:
             "clips": library, "sessions": sessions + youtube_sessions, "posts": posts, "counts": counts,
             "agents": {"clipping": {"active": len(sessions)}, "monitoring": monitoring,
                        "youtube_clipping": {"active": len(youtube_sessions)}, "youtube_monitoring": youtube_monitoring,
+                       "filtering": self.filtering.summary(),
                        "publishing": {"online": self.publisher.worker.is_alive(),
                                       "queued": sum(post["status"] == "queued" for post in posts),
                                       "active": sum(post["status"] == "working" for post in posts)}},
             "activity": recent, "chat": chat, "average_latency": latency,
             "accounts": self.publisher.accounts.summary(), "rehearsal": bool(self.options.rehearsal_input),
+            "publishing_platforms": self.publisher.platform_settings(),
             "chat_configured": twitch_chat_configured(),
+            "youtube_chat_configured": bool(youtube_chat_key()),
+            "youtube_session_configured": bool(youtube_session_cookies()),
             "top_caption_enabled": True,
             "clip_presets": [
                 {"id": key, "label": label, "before": before, "after": after,
@@ -196,7 +215,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(HTTPStatus.FORBIDDEN, {"error": "Use the local dashboard to make changes."})
         try:
             size = int(self.headers.get("Content-Length", "0"))
-            if not 0 < size <= 16_384:
+            maximum = 262144 if self.path == "/api/configure-youtube-session" else 16384
+            if not 0 < size <= maximum:
                 raise ValueError("Invalid request size.")
             data = json.loads(self.rfile.read(size))
             if not isinstance(data, dict):
@@ -214,6 +234,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.app.publisher.accounts.configure_meta(data.get("identifier"), data.get("secret"), data.get("config_id"))
             elif self.path == "/api/configure-youtube":
                 self.app.publisher.accounts.configure_youtube(data.get("identifier"), data.get("secret"))
+            elif self.path == "/api/configure-youtube-chat":
+                configure_youtube_chat(data.get("api_key"))
+            elif self.path == "/api/configure-youtube-session":
+                configure_youtube_session(data.get("cookies"))
             elif self.path == "/api/configure-buffer":
                 self.app.publisher.accounts.configure_buffer(data.get("buffer_key"), data.get("cloud_name"),
                                                              data.get("cloud_key"), data.get("cloud_secret"))
@@ -223,6 +247,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.app.publisher.accounts.disconnect(data.get("platform"))
             elif self.path == "/api/publish":
                 self.app.publisher.queue_post(data)
+            elif self.path == "/api/approve-screening":
+                response["resumed"] = self.app.filtering.approve(data.get("clip"), data.get("confirmed"))
+            elif self.path == "/api/publishing-platform":
+                self.app.publisher.set_platform(data.get("platform"), data.get("enabled"))
             else:
                 return self.json(HTTPStatus.NOT_FOUND, {"error": "Route not found."})
             self.json(HTTPStatus.OK, response)

@@ -177,7 +177,7 @@ class Renderer:
                 (work / "captions.srt").write_text(captions + "\n", encoding="utf-8")
                 layout += (
                     ",subtitles=captions.srt:"
-                    "force_style='FontSize=8,Bold=-1,Outline=1.4,Shadow=0,MarginV=31,MarginL=22,MarginR=22'"
+                    "force_style='FontSize=8,Bold=-1,Outline=1.4,Shadow=0,MarginV=38,MarginL=22,MarginR=22'"
                 )
             partial = output.with_name(f".{output.stem}-{uuid4().hex}.mp4")
             try:
@@ -346,7 +346,8 @@ def stop_process(process):
 def capture(options, renderer):
     events = queue.Queue()
     stop = threading.Event()
-    if options.chat:
+    youtube = options.source_url.startswith("https://www.youtube.com/")
+    if options.chat and not youtube:
         if not all(os.environ.get(key) for key in ("TWITCH_USER_TOKEN", "TWITCH_CLIENT_ID")):
             raise ValueError("Set TWITCH_USER_TOKEN and TWITCH_CLIENT_ID to enable Twitch chat")
     # NumPy's Windows initialization can wait on stdin while the input thread reads it.
@@ -354,7 +355,9 @@ def capture(options, renderer):
         renderer.prepare_model()
     threading.Thread(target=manual_marks, args=(events,), daemon=True).start()
     if options.chat:
-        threading.Thread(target=twitch_chat, args=(options.channel, events, stop), daemon=True).start()
+        from youtube_chat import read_chat
+        reader = read_chat if youtube else twitch_chat
+        threading.Thread(target=reader, args=(options.channel, events, stop), daemon=True).start()
 
     options.output_dir.mkdir(parents=True, exist_ok=True)
     with (
@@ -367,6 +370,8 @@ def capture(options, renderer):
             sys.executable, "-m", "streamlink", "--stdout",
             options.source_url, options.quality,
         ]
+        if youtube:
+            stream_command = [sys.executable, "-u", str(Path(__file__).with_name("youtube_capture.py")), options.channel]
         if options.input:
             stream_command = [
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-re", "-stream_loop", "-1",
@@ -516,8 +521,8 @@ def main():
             else:
                 options.channel = youtube_video_id(options.channel)
                 options.source_url = youtube_watch_url(options.channel)
-                if options.chat or options.input:
-                    parser.error("Use manual highlights for YouTube Live captures")
+                if options.input:
+                    parser.error("Local rehearsal is available for Twitch captures")
             if options.before <= 0 or options.after <= 0 or options.before + options.after > 120:
                 parser.error("Pre-roll and post-roll must be positive and total at most 120 seconds")
             capture(options, renderer)

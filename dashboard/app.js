@@ -122,8 +122,11 @@ function workflowSnapshot() {
 
 function agentStatus() {
   if (!state.agents) return "";
-  const {clipping, monitoring, publishing, youtube_clipping: youtubeClipping, youtube_monitoring: youtubeMonitor} = state.agents;
+  const {clipping, monitoring, publishing, filtering, youtube_clipping: youtubeClipping, youtube_monitoring: youtubeMonitor} = state.agents;
   return `<section class="agent-grid" aria-label="Workflow agents">
+    ${filtering ? `<div class="panel capture-card"><div class="capture-top">
+      <h3>${icon("film")} Filtering Agent</h3>${chip(filtering.active ? "Screening" : "Ready", filtering.active ? "purple" : "good")}
+    </div><p>${filtering.passed} passed · ${filtering.held} held for review</p></div>` : ""}
     <div class="panel capture-card"><div class="capture-top">
       <h3>${icon("scissors")} Twitch Clipping Agent</h3>${chip(clipping.active ? "Capturing" : "Idle", clipping.active ? "good" : "")}
     </div><p>${clipping.active} active captures · Exports clips for review</p></div>
@@ -148,6 +151,7 @@ function postLabel(status) {
     published: ["Accepted", "good"], uploaded: ["Uploaded", "good"], working: ["Working", "purple"],
     queued: ["Queued", "purple"],
     waiting: ["Waiting for account", "warn"],
+    screening: ["Screening", "purple"], held: ["Held by filter", "warn"],
     buffer_pending: ["In Buffer", "purple"],
     check: ["Check platform", "warn"], failed: ["Failed", "bad"],
   })[status] || [status, ""];
@@ -191,7 +195,7 @@ function captureCard(session) {
     </div></div><div class="capture-grid">
       <div>Rolling buffer<b>${seconds(session.buffer)}</b></div><div>Footage captured<b>${seconds(session.captured)}</b></div>
       <div>Waiting for post-roll<b>${session.waiting}</b></div><div>Rendering<b>${session.rendering}</b></div>
-    </div><p>${session.highlights} highlights · ${youtube ? "Manual highlights" : `Chat detection ${session.chat ? "on" : "off"}`}</p>
+    </div><p>${session.highlights} highlights · Chat detection ${session.chat ? "on" : "off"}</p>
     ${session.logs.length ? `<details data-log="${platform}:${escape(session.channel)}"><summary>Capture log</summary><pre>${escape(session.logs.join("\n"))}</pre></details>` : ""}</section>`;
 }
 
@@ -211,7 +215,7 @@ function streamMonitor(monitor, youtube = false) {
 }
 
 function chatTable() {
-  if (!state.chat.length) return '<div class="empty">No chat windows recorded. Enable chat detection when starting a Twitch capture.</div>';
+  if (!state.chat.length) return '<div class="empty">No chat windows recorded. Enable chat detection when starting a Twitch or YouTube Live capture.</div>';
   const rows = state.chat.slice(0, 20).map(item => `<tr><td>${escape(item.channel)}</td><td>${time(item.time)}</td>
     <td class="mono">${item.data.messages}</td><td class="mono">${item.data.users}</td><td>${item.data.spike ? chip("Spike", "purple") : chip("Baseline")}</td></tr>`).join("");
   return `<div class="table-wrap"><table><thead><tr><th>Channel</th><th>Window ended</th><th>Messages</th><th>Unique chatters</th><th>Signal</th></tr></thead><tbody>${rows}</tbody></table></div>`;
@@ -269,19 +273,30 @@ function safeLink(url) {
 function publishing() {
   const rows = state.posts.map(post => {
     const href = safeLink(post.url);
+    const paused = post.automatic && state.publishing_platforms?.[post.platform] === false && ["waiting", "queued"].includes(post.status);
     return `<tr><td>${escape(post.clip.split("/").at(-1))}</td><td>${escape(platforms[post.platform]?.name || post.platform)}</td>
-      <td>${escape(post.name)}</td><td>${chip(...postLabel(post.status))}</td>
+      <td>${escape(post.name)}</td><td>${paused ? chip("Paused") : chip(...postLabel(post.status))}</td>
       <td><span title="${escape(post.remote || "")}">${escape(post.detail)}</span></td><td>${time(post.updated)}</td>
       <td>${href ? `<a class="text-link" href="${escape(href)}" target="_blank" rel="noopener">Open post ${icon("arrow")}</a>` : "—"}</td></tr>`;
   }).join("");
   const count = status => state.posts.filter(post => post.status === status).length;
   const bufferReview = state.posts.some(post => post.buffer_asset && post.remote && ["buffer_pending", "check"].includes(post.status));
-  return heading("Publishing", "New live clips publish automatically to YouTube, Instagram and Facebook. YouTube Shorts are public.") + statRow([
+  const controls = state.publishing_platforms ? panel("Automatic publishing", "Choose where new clips are published. Changes save immediately.",
+    `<div class="capture-card"><div class="controls">${Object.entries(platforms).map(([key, entry]) =>
+      `<label class="check"><input type="checkbox" role="switch" data-auto-platform="${key}"${state.publishing_platforms[key] ? " checked" : ""}><span>${entry.name}</span></label>`).join("")}</div>
+      <p>Turning a platform off pauses its pending automatic uploads and excludes it from new clips. Turning it on resumes pending uploads. Uploads already in progress finish normally. YouTube Shorts are public.</p></div>`) : "";
+  const screening = state.agents.filtering;
+  const screeningPanel = screening ? panel("Content screening", "Local nudity detection checks every frame and screens the caption and subtitles for sexual-content language. Flagged clips and screening errors are held before upload.",
+    screening.recent.length ? `<div class="table-wrap"><table><thead><tr><th>Clip</th><th>Screening</th><th>Reason</th><th>Review</th></tr></thead><tbody>${screening.recent.map(item =>
+      `<tr><td>${escape(item.clip.split("/").at(-1))}</td><td>${chip(item.status === "approved" ? "Approved after review" : item.status === "passed" ? "Passed" : item.status === "scanning" ? "Screening" : "Held", ["passed", "approved"].includes(item.status) ? "good" : "warn")}</td><td>${escape(item.reason)}</td>
+      <td><button class="secondary" data-preview="${escape(item.clip)}">Preview</button>${item.status === "held" && !item.reason.startsWith("Sexual-content language") ? `<button class="secondary" data-review-screening="${escape(item.clip)}">Approve after review</button>` : ""}</td></tr>`).join("")}</tbody></table></div>` :
+      '<div class="empty">Clips are screened before automatic and manual uploads. Results will appear here.</div>') : "";
+  return heading("Publishing", "Control automatic publishing and track uploads by destination.") + controls + statRow([
     ["Accepted posts", count("published"), "Public requests accepted", "send"],
     ["Private / unlisted", count("uploaded"), "YouTube uploads", "film"],
-    ["In progress", count("queued") + count("working") + count("buffer_pending"), "Queued, uploading or processing", "timer"],
-    ["Needs attention", count("check") + count("failed") + count("waiting"), "Account needed, failed or awaiting verification", "activity"],
-  ]) + panel("Upload history", "", rows ? `<div class="table-wrap"><table><thead><tr><th>Clip</th><th>Platform</th>
+    ["In progress", count("queued") + count("working") + count("screening") + count("buffer_pending"), "Screening, queued, uploading or processing", "timer"],
+    ["Needs attention", count("check") + count("failed") + count("waiting") + count("held"), "Held clips, account needed or upload errors", "activity"],
+  ]) + screeningPanel + panel("Upload history", "", rows ? `<div class="table-wrap"><table><thead><tr><th>Clip</th><th>Platform</th>
     <th>Account</th><th>Status</th><th>Details</th><th>Updated</th><th>Post</th></tr></thead><tbody>${rows}</tbody></table></div>`
     : '<div class="empty">New live clips will appear here as soon as they’re ready.</div>',
     bufferReview ? '<button class="secondary" data-refresh-buffer>Check Buffer status</button>' :
@@ -310,7 +325,11 @@ function accounts() {
   }).join("");
   return heading("Publishing accounts", "Authorize the accounts where your clips can be published.") +
     (state.accounts.notice ? `<div class="panel empty" style="margin-bottom:14px" role="status">${escape(state.accounts.notice)}</div>` : "") +
-    `<div class="cards">${cards}</div><p style="margin-top:16px">Facebook Login can connect both Meta destinations. Connections stay active until the dashboard server restarts.</p>`;
+    `<div class="cards">${cards}</div>` + panel("YouTube live chat", state.youtube_chat_configured ? "API key saved. Chat-spike detection is available for new YouTube captures." : "Configure a YouTube Data API v3 key to detect highlights from live chat.",
+      `<div class="empty"><button class="secondary" data-setup="youtube-chat">${state.youtube_chat_configured ? "Update YouTube chat" : "Set up YouTube chat"}</button></div>`) +
+    panel("YouTube video capture", state.youtube_session_configured ? "A signed-in YouTube session is saved for capture." : "Import a signed-in YouTube session when video capture asks you to sign in.",
+      '<div class="empty"><button class="secondary" data-setup="youtube-session">Import YouTube session</button></div>') +
+    `<p style="margin-top:16px">Facebook Login can connect both Meta destinations. Windows encrypts saved connections for your user account.</p>`;
 }
 
 function pageName() {
@@ -391,8 +410,8 @@ function startDialog() {
     pattern="[a-zA-Z0-9_]{1,25}" placeholder="Channel login" autocomplete="off" autofocus></label>
     ${state.top_caption_enabled ? '<label>Top caption<input name="top_caption" maxlength="56" placeholder="Generated from speech if left blank"></label>' : ""}
     ${presets ? `<label>Clip length<select name="clip_preset">${presets}</select></label>` : ""}
-    <label class="check" data-twitch-option><input type="checkbox" name="chat"${state.chat_configured ? "" : " disabled"}>
-      <span>Detect chat spikes${state.chat_configured ? "" : "<br><small>Twitch OAuth is required for automatic detection.</small>"}</span></label>
+    <label class="check"><input type="checkbox" name="chat"${state.chat_configured ? "" : " disabled"}>
+      <span>Detect chat spikes<small data-chat-help>${state.chat_configured ? "" : "Twitch OAuth is required for automatic detection."}</small></span></label>
     ${state.rehearsal ? '<label class="check" data-twitch-option><input type="checkbox" name="rehearsal"><span>Use the local rehearsal recording<br><small>Rehearsal clips are 8 seconds.</small></span></label>' : ""}
     <p class="dialog-error" role="alert" hidden></p><div class="dialog-foot"><button type="button" class="secondary" data-close>Cancel</button><button class="primary">Start capture</button></div></form>`);
 }
@@ -405,6 +424,18 @@ function preview(id) {
     <p class="preview-meta">${seconds(clip.duration)} · ${clip.width} × ${clip.height} · ${bytes(clip.size)} · ${clip.cues} caption cues</p>
     <div class="dialog-foot">${clip.cues ? `<a class="button secondary" href="/captions?id=${encoded}">Download captions</a>` : ""}
       <button class="primary" data-publish="${escape(id)}">${icon("send")} Publish clip</button></div>`);
+}
+
+function reviewScreening(id) {
+  const screening = state.agents.filtering?.recent.find(item => item.clip === id);
+  if (!screening) return;
+  showDialog("Review visual screening flag", `<form id="screening-review-form" data-clip="${escape(id)}">
+    <video class="preview" controls playsinline preload="metadata" src="/clip?id=${encodeURIComponent(id)}"></video>
+    <p>${escape(screening.reason)}</p>
+    <label class="check"><input type="checkbox" name="confirmed" required><span>I reviewed this video, including the flagged scene, and approve it for publishing.</span></label>
+    <p>Approval applies to this clip and its current subtitles. Pending automatic uploads resume on enabled platforms.</p>
+    <p class="dialog-error" role="alert" hidden></p><div class="dialog-foot"><button type="button" class="secondary" data-close>Cancel</button><button class="primary">Approve and resume</button></div>
+  </form>`);
 }
 
 function publishDialog(id) {
@@ -449,6 +480,24 @@ function setVisibility(destination) {
 }
 
 function setup(provider) {
+  if (provider === "youtube-session") {
+    showDialog("Import YouTube session", `<form id="youtube-session-form" autocomplete="off">
+      <p>Export youtube.com cookies from the browser where the livestream plays, in Netscape cookies.txt format. Importing allows the video capture worker to use your signed-in YouTube session. Windows encrypts the saved session locally.</p>
+      <label>YouTube cookies file<input type="file" name="cookie_file" accept=".txt,text/plain" required></label>
+      <p class="dialog-error" role="alert" hidden></p>
+      <div class="dialog-foot"><button type="button" class="secondary" data-close>Cancel</button><button class="primary">Save YouTube session</button></div>
+    </form>`);
+    return;
+  }
+  if (provider === "youtube-chat") {
+    showDialog("Set up YouTube chat", `<form id="youtube-chat-form" autocomplete="off">
+      <p>Enable YouTube Data API v3 in your Google Cloud project and create an API key. Windows encrypts the saved key. Chat reading stops when the project’s quota is exhausted.</p>
+      <label>YouTube Data API key<input name="api_key" type="password" autocomplete="new-password" required></label>
+      <p class="dialog-error" role="alert" hidden></p>
+      <div class="dialog-foot"><button type="button" class="secondary" data-close>Cancel</button><button class="primary">Connect YouTube chat</button></div>
+    </form>`);
+    return;
+  }
   if (provider === "buffer") {
     showDialog("Set up Buffer for YouTube", `<form id="buffer-setup-form" autocomplete="off">
       <p>Connect your YouTube channel in Buffer and use the Free plans for Buffer and Cloudinary.${state.accounts.persistent ? " Windows encrypts the saved credentials for your user account." : " Paste the credentials here to load them for this session."}</p>
@@ -507,6 +556,7 @@ document.addEventListener("click", async event => {
   try {
     if (Object.hasOwn(data, "close")) dialog.close();
     if (data.preview) preview(data.preview);
+    if (data.reviewScreening) reviewScreening(data.reviewScreening);
     if (data.publish) publishDialog(data.publish);
     if (data.setup) setup(data.setup);
     if (data.connect) {
@@ -540,7 +590,25 @@ document.addEventListener("input", event => {
     document.querySelector("#clip-results").innerHTML = filteredClips();
   }
 });
-document.addEventListener("change", event => {
+document.addEventListener("change", async event => {
+  if (event.target.dataset.autoPlatform) {
+    const input = event.target;
+    const platform = input.dataset.autoPlatform;
+    const enabled = input.checked;
+    input.disabled = true;
+    try {
+      await action("publishing-platform", {platform, enabled});
+      state.publishing_platforms[platform] = enabled;
+      notify(`${platforms[platform].name} automatic publishing ${enabled ? "on" : "off"}.`);
+      await refresh(true);
+    } catch (error) {
+      input.checked = !enabled;
+      notify(error.message, true);
+    } finally {
+      input.disabled = false;
+    }
+    return;
+  }
   if (event.target.id === "period") {
     chartDays = Number(event.target.value);
     render();
@@ -566,6 +634,10 @@ document.addEventListener("change", event => {
       const input = label.querySelector("input");
       input.disabled = youtube || (input.name === "chat" && !state.chat_configured);
     });
+    const chatReady = youtube ? state.youtube_chat_configured : state.chat_configured;
+    form.elements.chat.disabled = !chatReady;
+    form.elements.chat.checked = false;
+    form.querySelector("[data-chat-help]").textContent = chatReady ? "" : youtube ? "Set up YouTube chat in Accounts to enable detection." : "Twitch OAuth is required for automatic detection.";
   }
 });
 dialog.addEventListener("submit", async event => {
@@ -583,6 +655,19 @@ dialog.addEventListener("submit", async event => {
         clip_preset: data.clip_preset || "highlight" });
       location.hash = "workflow";
       notify(`Starting ${data.channel}.`);
+    } else if (form.id === "screening-review-form") {
+      const result = await action("approve-screening", {clip: form.dataset.clip, confirmed: data.confirmed === "on"});
+      notify(result.resumed ? "Approved. Pending automatic uploads resumed on enabled platforms." : "Visual flag approved. Open the clip preview to submit an upload.");
+    } else if (form.id === "youtube-session-form") {
+      const file = form.elements.cookie_file.files[0];
+      if (!file || file.size > 200000) throw new Error("Choose a YouTube cookies.txt file up to 200 KB.");
+      await action("configure-youtube-session", {cookies: await file.text()});
+      form.reset();
+      notify("YouTube session saved. Start a new YouTube capture to use it.");
+    } else if (form.id === "youtube-chat-form") {
+      await action("configure-youtube-chat", data);
+      form.reset();
+      notify("YouTube chat key verified and saved.");
     } else if (form.id === "meta-setup-form") {
       await action("configure-meta", data);
       form.reset();

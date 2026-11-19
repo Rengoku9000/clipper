@@ -12,6 +12,7 @@ from pathlib import Path
 
 from clipper import CLIP_PRESETS, DEFAULT_CLIP_PRESET, normalize_top_caption, youtube_video_id, youtube_watch_url
 from twitch_chat_auth import capture_credentials
+from youtube_chat import api_key as youtube_chat_key
 
 
 EVENT_PREFIX = "CLIPPER_EVENT "
@@ -109,8 +110,8 @@ class ClippingAgent:
             channel = youtube_video_id(channel.strip())
             source = youtube_watch_url(channel)
             destination = self.clips / "dashboard" / "~youtube" / channel
-            if chat or rehearsal:
-                raise ValueError("YouTube Live capture uses manual highlights.")
+            if rehearsal:
+                raise ValueError("Local rehearsal is available for Twitch captures.")
         else:
             if not isinstance(channel, str) or not CHANNEL.fullmatch(channel):
                 raise ValueError("Enter a Twitch channel login.")
@@ -145,8 +146,14 @@ class ClippingAgent:
             environment = {key: value for key, value in os.environ.items()
                            if not key.startswith(("CLIPPER_META_", "CLIPPER_GOOGLE_"))}
             if chat:
-                client_id, token = capture_credentials()
-                environment.update(TWITCH_CLIENT_ID=client_id, TWITCH_USER_TOKEN=token)
+                if self.platform == "youtube":
+                    key = youtube_chat_key()
+                    if not key:
+                        raise ValueError("Set up YouTube chat in Accounts before enabling detection.")
+                    environment["YOUTUBE_CHAT_API_KEY"] = key
+                else:
+                    client_id, token = capture_credentials()
+                    environment.update(TWITCH_CLIENT_ID=client_id, TWITCH_USER_TOKEN=token)
             process = subprocess.Popen(
                 command, cwd=self.root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
@@ -173,6 +180,8 @@ class ClippingAgent:
                     if not line.startswith(EVENT_PREFIX):
                         if line:
                             session["logs"].append(re.sub(r"https?://[^\s)]+", "[URL]", line))
+                            if self.platform == "youtube" and "Sign in to confirm" in line:
+                                session["login_required"] = True
                             if self.platform == "youtube" and re.search(r"\b429 (?:Client Error|Too Many Requests)\b", line, re.IGNORECASE):
                                 session["rate_limited"] = True
                                 self.retry_after = time.monotonic() + YOUTUBE_RETRY_DELAY
@@ -206,6 +215,8 @@ class ClippingAgent:
             stopping = session["status"] == "Stopping"
             self.sessions.pop(channel, None)
             detail = next(reversed(session["logs"]), "")
+            if session.get("login_required") and not stopping and code != 0:
+                detail = "YouTube requires sign-in for video capture. Import a YouTube session in Accounts and start this capture again."
             if session.get("rate_limited") and not stopping and code != 0:
                 detail = "YouTube rate-limited the capture (HTTP 429). Wait a minute before trying the live link again."
             self.event(channel, "stopped" if stopping or code == 0 else "capture_failed",
@@ -228,7 +239,7 @@ class ClippingAgent:
         with self.lock:
             return [
                 {**{key: value for key, value in session.items()
-                    if key not in ("process", "watcher", "logs", "last_footage", "start_event", "rate_limited")},
+                    if key not in ("process", "watcher", "logs", "last_footage", "start_event", "rate_limited", "login_required")},
                  "logs": list(session["logs"])}
                 for session in self.sessions.values()
             ]

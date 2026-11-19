@@ -3,3 +3,5 @@ websockets
 faster-whisper
 numpy
 requests
+yt-dlp[default]
+nudenet==3.4.2
