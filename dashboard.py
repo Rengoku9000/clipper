@@ -20,6 +20,7 @@ from filtering_agent import FilteringAgent
 from publishing_agent import PublishingAgent
 from stream_monitoring_agent import StreamMonitoringAgent
 from twitch_chat_auth import configured as twitch_chat_configured
+from vod_workflow import VodWorkflow
 from youtube_chat import api_key as youtube_chat_key, configure as configure_youtube_chat
 from youtube_capture import cookies as youtube_session_cookies, configure as configure_youtube_session
 
@@ -81,6 +82,7 @@ class Dashboard:
         self.youtube_clipping = ClippingAgent(options, ROOT, CLIPS, self.db, platform="youtube")
         self.monitoring = StreamMonitoringAgent(self.clipping, self.db)
         self.youtube_monitoring = StreamMonitoringAgent(self.youtube_clipping, self.db)
+        self.vod = VodWorkflow(DATA, CLIPS, options.model)
         credentials = CredentialStore(DATA / "publishing-credentials.dpapi") if os.name == "nt" else None
         self.filtering = FilteringAgent(self.clipping, self.db)
         self.publisher = PublishingAgent(self.url, self.db, self.clipping, credentials, self.filtering)
@@ -96,6 +98,7 @@ class Dashboard:
             db.close()
 
     def overview(self):
+        vod = self.vod.snapshot()
         library = self.clipping.library()
         with self.clipping.lock:
             sessions = self.clipping.active_sessions()
@@ -131,6 +134,7 @@ class Dashboard:
             "youtube_chat_configured": bool(youtube_chat_key()),
             "youtube_session_configured": bool(youtube_session_cookies()),
             "top_caption_enabled": True,
+            "vod": vod,
             "clip_presets": [
                 {"id": key, "label": label, "before": before, "after": after,
                  "default": key == DEFAULT_CLIP_PRESET}
@@ -191,6 +195,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(HTTPStatus.OK, (ASSETS / filename).read_bytes(), content + "; charset=utf-8")
             elif path == "/api/overview":
                 self.json(HTTPStatus.OK, self.app.overview())
+            elif path == "/vod-frame":
+                frame = self.app.vod.frame(params.get("id", [""])[0], params.get("at", ["0"])[0])
+                self.reply(HTTPStatus.OK, frame, "image/jpeg")
             elif path in ("/clip", "/captions", "/thumbnail"):
                 video = self.app.clipping.clip_path(params.get("id", [""])[0])
                 if path == "/clip":
@@ -226,6 +233,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.app.clipper(data.get("platform", "twitch")).start(data.get("channel"), data.get("chat") is True,
                                data.get("rehearsal") is True, data.get("top_caption", ""),
                                data.get("clip_preset", DEFAULT_CLIP_PRESET))
+            elif self.path == "/api/vod-prepare":
+                response["vod"] = self.app.vod.prepare(data)
+            elif self.path == "/api/vod-start":
+                response["vod"] = self.app.vod.start(data)
             elif self.path in ("/api/mark", "/api/stop"):
                 self.app.clipper(data.get("platform", "twitch")).signal(data.get("channel"), self.path == "/api/stop")
             elif self.path == "/api/connect":

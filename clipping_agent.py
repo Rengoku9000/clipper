@@ -87,7 +87,8 @@ class ClippingAgent:
                 item = self.clip_stats(path).copy()
                 subs = path.with_suffix(".srt")
                 item["cues"] = subs.read_text(encoding="utf-8").count(" --> ") if subs.exists() else 0
-                item.update({f"suggested_{key}": value for key, value in self.caption_copy(path).items()})
+                item.update({f"suggested_{key}": value for key, value in self.caption_copy(path).items()
+                             if key in ("title", "description")})
                 clips.append(item)
             except (OSError, ValueError, IndexError, KeyError, subprocess.TimeoutExpired):
                 continue
@@ -98,7 +99,8 @@ class ClippingAgent:
         try:
             copy = json.loads(path.with_suffix(".captions.json").read_text(encoding="utf-8"))
             if isinstance(copy, dict):
-                return {key: copy[key] for key in ("title", "description") if isinstance(copy.get(key), str)}
+                return {key: copy[key] for key in ("title", "description", "source_kind")
+                        if isinstance(copy.get(key), str)}
         except (OSError, ValueError):
             pass
         return {}

@@ -70,6 +70,14 @@ class CaptureLogger:
         print(safe, file=sys.stderr, flush=True)
 
 
+def load_session(downloader):
+    text = cookies()
+    if text:
+        jar, _ = cookie_jar(text)
+        for cookie in jar:
+            downloader.cookiejar.set_cookie(cookie)
+
+
 def main():
     from yt_dlp import YoutubeDL
 
@@ -80,11 +88,7 @@ def main():
                "js_runtimes": {"node": {}}, "socket_timeout": 15, "retries": 3,
                "fragment_retries": 3, "hls_use_mpegts": True}
     with YoutubeDL(options) as downloader:
-        text = cookies()
-        if text:
-            jar, _ = cookie_jar(text)
-            for cookie in jar:
-                downloader.cookiejar.set_cookie(cookie)
+        load_session(downloader)
         raise SystemExit(downloader.download([f"https://www.youtube.com/watch?v={sys.argv[1]}"]))
 
 

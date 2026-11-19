@@ -238,7 +238,9 @@ class PublishingAgent:
                 record("Accepted by Buffer. Waiting for YouTube.", post["id"], "buffer_pending")
                 self.finish_buffer_post(identifier, account, buffer_asset, visibility, post)
                 return
-            remote, url = publish(identifier[1], account, path, title, description, visibility, made_for_kids, record)
+            copy = self.clips.caption_copy(path)
+            remote, url = publish(identifier[1], account, path, title, description, visibility, made_for_kids,
+                                  record, add_default_tags=copy.get("source_kind") != "vod")
             status = "uploaded" if identifier[1] == "youtube" and visibility != "public" else "published"
             record(f"Uploaded ({visibility})" if status == "uploaded" else "Accepted by platform",
                    remote, status, url)

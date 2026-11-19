@@ -138,7 +138,7 @@ pre { color: var(--muted); background: #12121a; padding: 12px; border-radius: 6p
 .event { display: grid; grid-template-columns: minmax(120px, 1fr) 2fr auto; border-top: 1px solid var(--stroke); padding: 10px 0; align-items: center; gap: 8px; font-size: 13px; }
 .event span:last-child { color: var(--muted); }
 .event p { overflow-wrap: anywhere; }
-input:not([type=checkbox]), select, textarea { width: 100%; min-height: 40px; padding: 9px 11px; background: #13131d; color: var(--text); border: 1px solid var(--stroke); border-radius: 7px; }
+input:not([type=checkbox], [type=radio]), select, textarea { width: 100%; min-height: 40px; padding: 9px 11px; background: #13131d; color: var(--text); border: 1px solid var(--stroke); border-radius: 7px; }
 textarea { resize: vertical; min-height: 82px; }
 .filters { display: flex; gap: 8px; align-items: center; }
 .filters input { width: 180px; }
@@ -147,7 +147,7 @@ form { display: grid; gap: 13px; }
 label { display: grid; gap: 6px; color: var(--text); font-size: 13px; }
 .check { display: flex; align-items: start; gap: 8px; line-height: 1.4; }
 .check[hidden] { display: none; }
-input[type=checkbox] { margin-top: 3px; accent-color: var(--accent); }
+input[type=checkbox], input[type=radio] { margin-top: 3px; accent-color: var(--accent); }
 .check small { color: var(--muted); }
 dialog { width: min(500px, calc(100% - 24px)); max-height: calc(100% - 26px); padding: 21px; border: 1px solid #47445b; border-radius: 14px; background: var(--card); color: var(--text); }
 dialog::backdrop { background: #06050bd0; }
@@ -155,6 +155,22 @@ dialog::backdrop { background: #06050bd0; }
 .dialog-head button { min-width: 37px; padding: 0; }
 .dialog-foot { display: flex; justify-content: end; gap: 8px; padding-top: 5px; }
 .dialog-error { color: var(--red); }
+.vod-status { margin-bottom: 14px; }
+dialog:has(#vod-crop-form) { width: min(720px, calc(100% - 24px)); }
+.vod-time { display: flex; align-items: end; gap: 8px; }
+.vod-time label { flex: 1; }
+.vod-modes { display: flex; gap: 16px; }
+.vod-frame { position: relative; overflow: hidden; border-radius: 8px; background: #08070c; touch-action: none; cursor: crosshair; }
+.vod-frame img { display: block; width: 100%; height: 100%; object-fit: fill; pointer-events: none; }
+.vod-box { position: absolute; border: 2px solid var(--accent); box-shadow: 0 0 0 1px #100b1f; pointer-events: none; }
+.vod-box.gameplay { border-color: #68dfb0; }
+.vod-fields { border: 1px solid var(--stroke); border-radius: 8px; padding: 8px 10px 10px; min-width: 0; }
+.vod-fields legend { padding: 0 4px; }
+.vod-numbers { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.vod-numbers input { width: 100%; min-width: 0; }
+.vod-settings { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr); }
+.vod-drafts { display: grid; gap: 8px; margin: 12px 0; }
+dialog progress { display: block; width: 100%; margin: 12px 0; accent-color: var(--accent); }
 .preview { display: block; width: auto; max-width: 100%; max-height: min(63vh, 570px); margin: 0 auto 13px; border-radius: 8px; background: black; }
 .preview-meta { margin-bottom: 12px; text-align: center; }
 .setup { display: grid; gap: 13px; }

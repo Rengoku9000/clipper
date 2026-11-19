@@ -454,7 +454,8 @@ def reel_description(title, description):
     return "\n\n".join(filter(None, (description, " ".join(tags))))
 
 
-def publish(platform, account, path, title, description, visibility, made_for_kids, record):
+def publish(platform, account, path, title, description, visibility, made_for_kids, record, *,
+            add_default_tags=True):
     token = account["token"]
     identifier = account["id"]
     if platform == "youtube":
@@ -468,7 +469,8 @@ def publish(platform, account, path, title, description, visibility, made_for_ki
         record("Submitting video", None)
         remote = upload_binary("PUT", session.headers["Location"], path, token)["id"]
         return remote, f"https://www.youtube.com/shorts/{remote}"
-    description = reel_description(title, description)
+    if add_default_tags:
+        description = reel_description(title, description)
     if platform == "facebook":
         endpoint = f"{identifier}/video_reels"
         session = graph("POST", endpoint, token, data={"upload_phase": "start"})

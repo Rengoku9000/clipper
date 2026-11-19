@@ -42,6 +42,23 @@ YouTube video capture uses yt-dlp with FFmpeg and a Node.js runtime for YouTube 
 
 The chat detector needs at least one minute of baseline. A spike requires at least five unique chatters and at least three times the recent median count. The cooldown is at least 30 seconds and grows with longer clip windows to avoid overlapping chat-triggered clips. If the video feed ends, restart capture to reconnect. Press Ctrl+C to stop.
 
+## Clip a past YouTube stream
+
+In the dashboard, open **Clip library → Clip past video**. Paste a YouTube link or enter the path to a local recording. Preview a frame where both the facecam and gameplay are visible, then draw each crop or enter its pixel coordinates. Set the game name for hashtags and generate drafts. To pick your own moments, enter start–end ranges in seconds. The crop settings apply to the full batch, so choose ranges with a consistent layout. The agent runs in the background while the dashboard server is open. Open its job card to check progress or preview the results.
+
+Run the VOD agent from the project folder with an ended YouTube livestream URL or a local recording. The facecam and optional gameplay crops use source pixels in `X Y WIDTH HEIGHT` order. The example coordinates are for a 1920 × 1080 source with a camera in the upper left. Adjust them to match your recording.
+
+```powershell
+& .\.venv\Scripts\python.exe vod_agent.py 'https://www.youtube.com/watch?v=YOUR_VIDEO_ID' `
+    --facecam 32 24 480 270 --game 'Minecraft'
+```
+
+Use `--allow-upload` for a regular YouTube video. If you already have a local copy of the video, supply its YouTube URL and `--recording PATH` to use the local file and keep the timestamped source link in the post copy.
+
+The agent ranks audio peaks and spoken reactions, then renders up to three non-overlapping clips targeting 30 seconds each. Use `--count` and `--duration` to adjust the batch, or repeat `--range START END` to select specific times in seconds. By default the gameplay panel uses the full source frame. Supply `--gameplay X Y WIDTH HEIGHT` if you want to exclude the original facecam or another overlay.
+
+Each draft has the facecam above the gameplay, burned-in subtitles when speech is detected, an editable SRT, and suggested post copy with hashtags. The dashboard's **Clip library** picks up the default output folder and prefills the Publish dialog. To change burned-in captions, the video needs to be rendered again. VOD drafts are published manually. Transcription runs locally with Whisper.
+
 ## Dashboard
 
 Start the dashboard from the project folder and open [localhost:8765](http://localhost:8765).

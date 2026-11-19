@@ -237,7 +237,7 @@ function workflow() {
     ["Highlights marked", count("marked"), "Manual and chat-triggered", "bolt"],
     ["Renders completed", count("ready"), "Recorded by this dashboard", "film"],
     ["Workflow failures", count("failed") + count("capture_failed"), "Capture and rendering errors", "activity"],
-  ]) + `<div class="stack">${streamMonitor(state.agents?.monitoring)}${streamMonitor(state.agents?.youtube_monitoring, true)}${captures}${panel("Chat activity", "Latest 10-second windows", chatTable())}
+  ]) + `<div class="stack">${vodPanel()}${streamMonitor(state.agents?.monitoring)}${streamMonitor(state.agents?.youtube_monitoring, true)}${captures}${panel("Chat activity", "Latest 10-second windows", chatTable())}
     ${panel("Activity log", "Latest workflow events", activity ? `<div class="activity">${activity}</div>` : '<div class="empty">No workflow events yet.</div>')}</div>`;
 }
 
@@ -255,9 +255,19 @@ function library() {
     <select id="clip-filter" aria-label="Filter by captions"><option value="all">All clips</option>
       <option value="captioned"${clipFilter === "captioned" ? " selected" : ""}>Captioned</option>
       <option value="uncaptioned"${clipFilter === "uncaptioned" ? " selected" : ""}>Without captions</option></select></div>`;
-  return heading("Clip library", "Preview and inspect the clips saved on this computer.", filters) +
+  return heading("Clip library", "Preview and inspect the clips saved on this computer.",
+    '<button class="primary" data-vod-open>Clip past video</button>') +
+    vodPanel() +
     panel("Saved clips", `${state.clips.length} files · ${seconds(totalSeconds)} total footage · ${bytes(totalSize)}`,
-      `<div id="clip-results">${filteredClips()}</div>`);
+      `<div id="clip-results">${filteredClips()}</div>`, filters);
+}
+
+function vodPanel() {
+  const job = state.vod;
+  if (!job) return "";
+  return `<div class="vod-status">${panel("Past-video agent", escape(job.title || job.detail),
+    job.title ? `<p>${escape(job.detail)}</p>` : "",
+    '<button class="secondary" data-vod-open>Open job</button>')}</div>`;
 }
 
 function safeLink(url) {
@@ -376,6 +386,7 @@ async function refresh(force = false) {
     } else {
       state = fresh;
     }
+    updateVodDialog();
     status.innerHTML = '<span class="led"></span>Engine online';
     status.classList.remove("offline");
   } catch {
@@ -414,6 +425,157 @@ function startDialog() {
       <span>Detect chat spikes<small data-chat-help>${state.chat_configured ? "" : "Twitch OAuth is required for automatic detection."}</small></span></label>
     ${state.rehearsal ? '<label class="check" data-twitch-option><input type="checkbox" name="rehearsal"><span>Use the local rehearsal recording<br><small>Rehearsal clips are 8 seconds.</small></span></label>' : ""}
     <p class="dialog-error" role="alert" hidden></p><div class="dialog-foot"><button type="button" class="secondary" data-close>Cancel</button><button class="primary">Start capture</button></div></form>`);
+}
+
+function vodDialog(job = state.vod) {
+  if (!job || job.phase === "failed") {
+    showDialog("Clip past video", `<form id="vod-source-form" data-vod-phase="${job?.phase || "new"}">
+      <label>YouTube URL or local video path<input name="source" required maxlength="4096" autocomplete="off"
+        value="${escape(job?.url || "")}" placeholder="https://www.youtube.com/watch?v=…" autofocus></label>
+      <p>Open a finished stream, a YouTube upload, or a recording saved on this computer.</p>
+      <p class="dialog-error" role="alert"${job?.error ? "" : " hidden"}>${escape(job?.error || "")}</p>
+      <div class="dialog-foot"><button class="primary">Open video</button></div>
+    </form>`);
+    return;
+  }
+  if (job.phase === "crop") {
+    vodCropDialog(job);
+    return;
+  }
+  const ready = job.phase === "ready";
+  const drafts = ready ? job.clips.map((id, index) => {
+    const clip = state.clips.find(item => item.id === id);
+    return `<button class="secondary" data-preview="${escape(id)}">${escape(clip?.suggested_title || `Preview clip ${index + 1}`)}</button>`;
+  }).join("") : "";
+  showDialog(ready ? "Drafts ready" : "Clip past video", `<div data-vod-phase="${escape(job.phase)}" data-vod-id="${escape(job.id)}">
+    ${job.title ? `<h3>${escape(job.title)}</h3>` : ""}
+    <p data-vod-detail role="status">${escape(job.detail)}</p>
+    ${ready ? `<div class="vod-drafts">${drafts}</div><div class="dialog-foot"><button class="secondary" data-vod-new>Open another video</button></div>`
+      : '<progress aria-label="Past-video job in progress"></progress><div class="dialog-foot"><button class="secondary" data-close>Close</button></div>'}
+  </div>`);
+}
+
+let savedVodEdits;
+
+function updateVodDialog() {
+  const current = dialog.querySelector("[data-vod-phase]");
+  const job = state.vod;
+  if (!dialog.open || !current || !job || current.dataset.vodPhase === "new") return;
+  if (current.dataset.vodPhase !== job.phase || (current.dataset.vodId && current.dataset.vodId !== job.id)) {
+    vodDialog(job);
+  } else {
+    const detail = current.querySelector("[data-vod-detail]");
+    if (detail && detail.textContent !== job.detail) detail.textContent = job.detail;
+  }
+}
+
+function vodCropDialog(job) {
+  const initialTime = Math.floor(Math.min(job.duration / 10, 30) * 10) / 10;
+  const cropInputs = (name, label) => `<fieldset class="vod-fields"><legend>${label}</legend>
+    <div class="vod-numbers">${["X", "Y", "Width", "Height"].map((label, index) => `<label>${label}
+      <input name="${name}_${index}" type="number" min="${index < 2 ? 0 : 2}" step="1"
+        max="${index % 2 ? job.height : job.width}"${name === "facecam" ? " required" : ""}></label>`).join("")}</div></fieldset>`;
+  showDialog("Set video crops", `<form id="vod-crop-form" data-vod-phase="crop" data-vod-id="${escape(job.id)}">
+    <p>${escape(job.title)} · ${job.width} × ${job.height} · ${seconds(job.duration)}</p>
+    <div class="vod-time"><label>Preview time (seconds)<input name="at" type="number" min="0" max="${Math.max(0, job.duration - 0.01)}"
+      step="any" value="${initialTime}"></label><button type="button" class="secondary" data-vod-frame>Show frame</button></div>
+    <p id="vod-crop-help">Choose a frame with both facecam and gameplay. Drag to draw the selected area, or enter its pixel coordinates.</p>
+    <div class="vod-modes" role="group" aria-label="Area to draw">
+      <label class="check"><input type="radio" name="crop_mode" value="facecam" checked><span>Facecam</span></label>
+      <label class="check"><input type="radio" name="crop_mode" value="gameplay"><span>Gameplay</span></label>
+    </div>
+    <div class="vod-frame" aria-describedby="vod-crop-help" style="aspect-ratio: ${job.width} / ${job.height}">
+      <img alt="Source video frame for setting the crop" draggable="false">
+      <span class="vod-box facecam" hidden></span><span class="vod-box gameplay" hidden></span>
+    </div>
+    ${cropInputs("facecam", "Facecam on top")}
+    ${cropInputs("gameplay", "Gameplay below · leave blank for full frame")}
+    <div class="vod-numbers vod-settings">
+      <label>Game for hashtags<input name="game" maxlength="80"></label>
+      <label>Clip count<input name="count" type="number" value="3" min="1" max="10" required></label>
+      <label>Target seconds<input name="duration" type="number" value="30" min="10" max="60" required></label>
+    </div>
+    <details><summary>Use specific time ranges</summary><label>One start–end range per line, in seconds
+      <textarea name="ranges" rows="3" maxlength="300" placeholder="120–145"></textarea></label></details>
+    <p class="dialog-error" role="alert"${job.error ? "" : " hidden"}>${escape(job.error)}</p>
+    <div class="dialog-foot"><button type="button" class="secondary" data-vod-new>Open another video</button>
+      <button class="primary">Generate drafts</button></div>
+  </form>`);
+  const form = dialog.querySelector("#vod-crop-form");
+  if (savedVodEdits?.id === job.id) {
+    for (const [name, value] of Object.entries(savedVodEdits.data)) form.elements[name].value = value;
+  }
+  wireVodCrop(form, job);
+}
+
+function wireVodCrop(form, job) {
+  const frame = form.querySelector(".vod-frame");
+  const image = frame.querySelector("img");
+  const errorBox = form.querySelector(".dialog-error");
+  const fields = area => Array.from({length: 4}, (_, index) => form.elements[`${area}_${index}`]);
+  const drawBox = area => {
+    const inputs = fields(area);
+    const box = frame.querySelector(`.${area}`);
+    const [x, y, width, height] = inputs.map(input => Number(input.value));
+    box.hidden = inputs.some(input => input.value === "") || width < 2 || height < 2;
+    Object.assign(box.style, {left: `${100 * x / job.width}%`, top: `${100 * y / job.height}%`,
+      width: `${100 * width / job.width}%`, height: `${100 * height / job.height}%`});
+  };
+  function showFrame() {
+    if (!form.elements.at.checkValidity() || form.elements.at.value === "") {
+      errorBox.textContent = "Choose a preview time within the video.";
+      errorBox.hidden = false;
+      return;
+    }
+    errorBox.hidden = true;
+    image.src = `/vod-frame?id=${encodeURIComponent(job.id)}&at=${encodeURIComponent(form.elements.at.value)}`;
+  }
+  image.addEventListener("error", () => {
+    errorBox.textContent = "No frame available at this time. Try a nearby time.";
+    errorBox.hidden = false;
+  });
+  form.querySelector("[data-vod-frame]").addEventListener("click", showFrame);
+  ["facecam", "gameplay"].forEach(area => {
+    drawBox(area);
+    fields(area).forEach(input => input.addEventListener("input", () => drawBox(area)));
+  });
+  let drag;
+  const point = event => {
+    const rect = frame.getBoundingClientRect();
+    return [Math.round(job.width * Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width))),
+      Math.round(job.height * Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)))];
+  };
+  frame.addEventListener("pointerdown", event => {
+    if (event.button !== 0 || !image.complete || !image.naturalWidth || drag) return;
+    drag = {id: event.pointerId, start: point(event), area: form.elements.crop_mode.value};
+    frame.setPointerCapture(event.pointerId);
+  });
+  frame.addEventListener("pointermove", event => {
+    if (drag?.id !== event.pointerId) return;
+    const [x, y] = point(event);
+    const [startX, startY] = drag.start;
+    const values = [Math.min(x, startX), Math.min(y, startY), Math.abs(x - startX), Math.abs(y - startY)];
+    fields(drag.area).forEach((input, index) => { input.value = values[index]; });
+    drawBox(drag.area);
+  });
+  frame.addEventListener("lostpointercapture", () => { drag = null; });
+  image.src = `/vod-frame?id=${encodeURIComponent(job.id)}&at=${encodeURIComponent(form.elements.at.value || "0")}`;
+}
+
+function vodOptions(form, data) {
+  const crop = area => {
+    const values = Array.from({length: 4}, (_, index) => data[`${area}_${index}`]);
+    if (values.every(value => value === "")) return null;
+    if (values.some(value => value === "")) throw new Error(`Fill in all four ${area} coordinates.`);
+    return values.map(Number);
+  };
+  const ranges = data.ranges.split(/\r?\n/).filter(line => line.trim()).map(line => {
+    const match = line.match(/^\s*(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)\s*$/);
+    if (!match) throw new Error("Enter time ranges as start–end seconds, one per line.");
+    return [Number(match[1]), Number(match[2])];
+  });
+  return {id: form.dataset.vodId, facecam: crop("facecam"), gameplay: crop("gameplay"), ranges,
+    count: Number(data.count), duration: Number(data.duration), game: data.game};
 }
 
 function preview(id) {
@@ -555,6 +717,8 @@ document.addEventListener("click", async event => {
   const data = button.dataset;
   try {
     if (Object.hasOwn(data, "close")) dialog.close();
+    if (Object.hasOwn(data, "vodOpen")) vodDialog();
+    if (Object.hasOwn(data, "vodNew")) vodDialog(null);
     if (data.preview) preview(data.preview);
     if (data.reviewScreening) reviewScreening(data.reviewScreening);
     if (data.publish) publishDialog(data.publish);
@@ -649,7 +813,16 @@ dialog.addEventListener("submit", async event => {
   errorBox.hidden = true;
   if (button) button.disabled = true;
   try {
-    if (form.id === "capture-form") {
+    if (form.id === "vod-source-form" || form.id === "vod-crop-form") {
+      if (form.id === "vod-crop-form") savedVodEdits = {id: form.dataset.vodId, data};
+      const result = form.id === "vod-source-form"
+        ? await action("vod-prepare", {source: data.source.trim()})
+        : await action("vod-start", vodOptions(form, data));
+      state.vod = result.vod;
+      vodDialog(result.vod);
+      await refresh(true);
+      return;
+    } else if (form.id === "capture-form") {
       await action("start", { channel: data.channel.trim(), platform: data.platform, chat: data.chat === "on",
         rehearsal: data.rehearsal === "on", top_caption: data.top_caption || "",
         clip_preset: data.clip_preset || "highlight" });
